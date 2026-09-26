@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import _store
-from ._codec import encode
+from ._codec import vector_to_sqlite_vector
 from ._connection import open_connection
 from ._schema import TABLE_NAME, Schema, build_ddl, parse_ddl
 
@@ -119,7 +119,7 @@ class VecStore:
         # 边遍历边materialize，生成器只会被消费一次
         for record in records:
             chunk_id = _store.check_record(schema, record)
-            blob = encode(record["vector"], schema.dim)
+            blob = vector_to_sqlite_vector(record["vector"], schema.dim)
             rows.append(
                 (
                     chunk_id,
@@ -175,7 +175,7 @@ class VecStore:
         params: list = [_now()]
         if vector is not None:
             columns.append("embedding")
-            params.append(encode(vector, schema.dim))
+            params.append(vector_to_sqlite_vector(vector, schema.dim))
         for name, value in changes.items():
             # chunk_id / created_at / updated_at 都不在 schema.fields 里，
             # 于是「绝不生成 SET chunk_id = ...」是自然成立的
@@ -215,7 +215,7 @@ class VecStore:
         schema = self._require_schema()
         k = _store.check_k(k)
         conditions = _store.check_where(schema, where)
-        blob = encode(vector, schema.dim)
+        blob = vector_to_sqlite_vector(vector, schema.dim)
 
         sql, keys = _store.build_search(schema, conditions)
         params = [blob, *(conditions[key] for key in keys), k]
