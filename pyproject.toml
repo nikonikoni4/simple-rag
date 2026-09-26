@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simple-rag"
+version = "0.1.0"
+description = "学习用的 RAG 单体实现"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "requests",
+    "python-dotenv",
+    "sqlite-vec",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+# 只把 simple_rag 当作模块打包 —— 根目录的 docs/ 与 tests/ 不是包
+[tool.setuptools.packages.find]
+include = ["simple_rag*"]
+exclude = ["simple_rag.repository.tests*"]
+
+[tool.pytest.ini_options]
+# 让 `pytest`（不带 -m）也能 import 到 simple_rag：
+# 直接调 pytest 时 CWD 不会自动进 sys.path，只有 `python -m pytest` 才会。
+pythonpath = ["."]
+testpaths = ["tests", "simple_rag"]
