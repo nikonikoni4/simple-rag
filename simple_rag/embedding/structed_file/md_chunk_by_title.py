@@ -708,11 +708,85 @@ def content_cut(
     return base_line + back, 0
 
 
+def _join_chunks(chunks: list[ChunkDraft]) -> ChunkDraft:
+    """把若干 chunk 按阅读顺序拼成一个。
+
+    `ChunkDraft.__post_init__` 会从拼好的 `segments` 重推行区间、`special_content`、
+    `content_hash` 和 `chunk_id`，所以这里只管拼段、累加 token。
+
+    Args:
+        chunks: 同源（同一 `file_path`）的 chunk，非空。
+
+    Returns:
+        拼成的单个 chunk。
+    """
+    return ChunkDraft(
+        segments=[seg for chunk in chunks for seg in chunk.segments],
+        file_path=chunks[0].file_path,
+        tokens=sum(chunk.tokens for chunk in chunks),
+    )
+
+
+def _merge_small_chunks(
+    chunks: list[ChunkDraft], min_token: int
+) -> list[ChunkDraft]:
+    """把 token 量小于 `min_token` 的 chunk 并进相邻的 chunk。
+
+    短 chunk 在检索里会当「吸引子」：文本越短，向量越「通用」，跟什么查询都不算远。
+    实测一个 13 token 的块在多个不相关查询里排到第 1，把正确答案挤到第 2。
+    并进邻居之后它只作为上下文存在，不再单独参与召回。
+
+    归宿按优先级逐块扫一遍决定：
+
+    1. **并进上一个** —— 短块多半是紧跟大块之后被 flush 出来的，并回去最自然
+    2. **没有上一个就并进下一个** —— 文档开头就是短块时；下一个还没出现，先攒着
+    3. **两边都没有就丢弃** —— 整篇只切出一个短块，没有可依附的邻居
+
+    合并**不重新判定**：只认 `cut` 产出的原始大小，拼出来的结果再小也不继续找下家。
+    只并相邻块，所以合并后的行区间仍然连续。
+
+    Note:
+        合并会让 chunk 超过 `max_token` —— 短块是塞进已经装好的邻居里的，不是重新装箱。
+        这是刻意的取舍：短块单独成块对检索的伤害比这一点溢出大。
+
+    Args:
+        chunks: `cut` 产出的 chunk 列表，按阅读顺序。
+        min_token: 判定阈值，`tokens` 严格小于它的算短块。
+
+    Returns:
+        合并后的列表。整篇只切出一个短块时返回空列表。
+    """
+    merged: list[ChunkDraft] = []
+    pending: list[ChunkDraft] = []  # 攒下的短块，等下一个正常块出现
+
+    for chunk in chunks:
+        if chunk.tokens >= min_token:
+            # 正常块：先把它前面攒着的短块并进来（那些短块没有「上一个」）
+            merged.append(_join_chunks(pending + [chunk]) if pending else chunk)
+            pending = []
+        elif merged:
+            # 短块，且有上一个：并回去
+            merged[-1] = _join_chunks([merged[-1], chunk])
+        else:
+            # 短块，且没有上一个：攒着等下一个
+            pending.append(chunk)
+
+    if pending:
+        if merged:
+            merged[-1] = _join_chunks([merged[-1], *pending])
+        elif len(pending) > 1:
+            # 整篇全是短块：合成一个，比全部丢掉强
+            merged.append(_join_chunks(pending))
+        # 否则整篇只有这一个短块 —— 没有可依附的邻居，丢弃
+    return merged
+
+
 def cut(
     root:MDFileHead,
     max_token:int,
     file_path:str,
     overlop:int|None=None,
+    min_token:int|None=None,
 )->list[ChunkDraft]:
     """按标题把整棵树切成 chunk。
 
@@ -728,9 +802,12 @@ def cut(
         file_path: 来源文件路径，原样写进每个 `ChunkDraft`。它直接参与 `chunk_id`，
             所以传相对路径才能让 ID 跨机器可移植。
         overlop: 重叠区 token 数，透传给 `content_cut`。
+        min_token: 短块阈值（token）。小于它的 chunk 会被并进相邻 chunk，
+            `None`（默认）表示不做合并。取舍见 `_merge_small_chunks`。
 
     Returns:
-        按阅读顺序排列的 `ChunkDraft` 列表。整篇装得下时只返回一个。
+        按阅读顺序排列的 `ChunkDraft` 列表。整篇装得下时只返回一个；
+        给了 `min_token` 且整篇只切出一个短块时返回空列表。
     """
     spans = _locate_spans(root)
     chunk_list: list[ChunkDraft] = []
@@ -778,10 +855,12 @@ def cut(
 
     _cut(root)
     flush()
-    return chunk_list
+    if min_token is None:
+        return chunk_list
+    return _merge_small_chunks(chunk_list, min_token)
 
 
-def chunk_by_title(file_path:Path,max_token,start_line,end_line=None,summary_func:Callable[[str], str]|None = None)->list[ChunkDraft]:
+def chunk_by_title(file_path:Path,max_token,start_line,end_line=None,summary_func:Callable[[str], str]|None = None,min_token:int|None = None)->list[ChunkDraft]:
     """按标题把一个 Markdown 文件切成 chunk 草稿。
 
     流程：读取文件 -> 按行切片 -> 清洗 -> 建标题树 -> 并发总结特殊块 -> 切分。
@@ -794,28 +873,34 @@ def chunk_by_title(file_path:Path,max_token,start_line,end_line=None,summary_fun
         summary_func: 总结函数，入参是代码块 / 表格的原文，返回摘要文本。
             **由调用方注入**，本模块不绑定任何模型服务。传 `None` 则整步跳过，
             各块的 `summary` 保持 `None`。单个块抛异常只记 warning，不影响其余块。
+        min_token: 短块阈值（token）。小于它的 chunk 会被并进相邻 chunk，
+            `None`（默认）表示不做合并。**阈值不设默认值** —— 短 chunk 在检索里
+            会当「吸引子」，合并与不合并、阈值取多少，都得按调用方自己的语料实测
+            才知道，所以这里只给开关、不给建议值。取舍见 `_merge_small_chunks`。
 
     Returns:
-        按阅读顺序排列的 `ChunkDraft` 列表。
+        按阅读顺序排列的 `ChunkDraft` 列表。给了 `min_token` 且整篇只切出一个
+        短块时返回空列表。
 
     Note:
         第 4 步之后的行号是相对**清洗后**文本的；叠加这里的切片偏移后，它已经
         不等于原文件行号。要精确回溯原文需要额外维护映射 —— `_clean_file_content`
         会吃掉连续空行，所以映射不是简单加一个偏移量。
 
-        **`max_token` 是软约束**，有三种情况会被突破：代码块 / 表格不从中间切开，
-        超长单行不切行内（切分是行级的），以及整块拿不下时的退让。真实语料上
-        （`data/lifeprismData`，938 个 chunk）约 2.9% 超限，全部是超长单行。
+        **`max_token` 是软约束**，唯一会突破的情况是**原子块**（代码块 / 表格）
+        自己就超预算 —— 整块保留，不从中间切开。纯文本不会超限：默认切点在行边界，
+        一行自己超预算时会改在行内切（标点优先，无标点则按字符硬切）。
+        实测 `data/` 全部语料 @1024：477 个 chunk，2 个超限，都是原子块。
 
         **`max_token` 不含特殊块摘要。** 摘要和面包屑一样是独立字段，不插进
-        `original_content`，只在算 embedding 时才拼进去（见 `types.py`）。所以送进
-        embedding 的文本比 `max_token` 多出「本 chunk 内特殊块摘要之和」。设
-        `max_token` 时请自行留余量。
+        `Segment.text`，只在算 embedding 时才由 `render_text(..., with_summary=True)`
+        拼进去（见 `types.py`）。所以送进 embedding 的文本比 `max_token` 多出
+        「本 chunk 内特殊块摘要之和」。设 `max_token` 时请自行留余量。
 
         之所以不在切分时把摘要算进去：摘要由外部服务生成、失败只 warning，
-        一旦它参与 `total_tokens`，同一份文件就会因为一次网络抖动切出不同的
-        `start_line`/`end_line`，`chunk_id` 的位置寻址幂等性随之失效。若将来
-        实测确有必要，做法是给 `SpecialContent` 加 `token` 字段、总结后回填，
+        一旦它参与 `total_tokens`，同一份文件就会因为一次网络抖动切出不同的结果，
+        `chunk_id` 的稳定性随之失效（主键按内容算，而内容不含摘要）。
+        若将来实测确有必要，做法是给 `SpecialContent` 加 `token` 字段、总结后回填，
         再重算一次 `total_tokens`（注意那会让切分结果依赖服务可用性）。
     """
     # 1. 读取文件
@@ -835,7 +920,7 @@ def chunk_by_title(file_path:Path,max_token,start_line,end_line=None,summary_fun
         _summarize_specials(_collect_specials(filetree), summary_func)
 
     # 5. 切分
-    return cut(filetree, max_token, str(file_path))
+    return cut(filetree, max_token, str(file_path), min_token=min_token)
 
 if __name__ =="__main__":
     file_path = Path(r"D:\desktop\软件开发\RAG\data\lifeprismData\diary\2025\01\2025-01-16.md")

@@ -2,12 +2,13 @@
 
 from pathlib import Path
 
-from simple_rag.embedding.structed_file.types import render_text
+from simple_rag.embedding.structed_file.types import ChunkDraft, Segment, render_text
 from simple_rag.embedding.structed_file.md_chunk_by_title import (
     _build_file_tree,
     _clean_file_content,
     _fill_special,
     _locate_spans,
+    _merge_small_chunks,
     chunk_by_title,
     cut,
 )
@@ -273,3 +274,105 @@ def test_大文档不会死循环且chunk不重复(tmp_path):
     assert len(drafts) < 200  # 有重叠但不会退化成「一行一个 chunk」
     ids = [d.start_line for d in drafts]
     assert len(ids) == len(set(ids))  # 起始行互不相同 -> chunk_id 不会撞
+
+
+# --------------------------------------------------------------- 短块合并
+#
+# 短 chunk 在检索里会当「吸引子」：文本越短，向量越「通用」，跟什么查询都不算远。
+# 实测一个 13 token 的块在多个不相关查询里排到第 1。`min_token` 把这些短块并进邻居，
+# 让它们只作为上下文存在，不再单独参与召回。
+
+
+def _draft(tokens: int, start_line: int) -> ChunkDraft:
+    """造一个只含一段的 chunk，token 数可控 —— 单独测合并逻辑用。"""
+    seg = Segment(
+        pref="标题",
+        text="正文",
+        start_line=start_line,
+        end_line=start_line,
+        tokens=tokens,
+    )
+    return ChunkDraft(segments=[seg], file_path="doc.md", tokens=tokens)
+
+
+def _shape(chunks) -> list[int]:
+    """各 chunk 的 token 数，用来看合并结果。"""
+    return [c.tokens for c in chunks]
+
+
+def test_短块并进上一个():
+    assert _shape(_merge_small_chunks([_draft(100, 0), _draft(5, 1)], 30)) == [105]
+
+
+def test_短块没有上一个就并进下一个():
+    assert _shape(_merge_small_chunks([_draft(5, 0), _draft(100, 1)], 30)) == [105]
+
+
+def test_短块两边都没有就丢弃():
+    assert _merge_small_chunks([_draft(5, 0)], 30) == []
+
+
+def test_连续短块都并进上一个():
+    chunks = [_draft(100, 0), _draft(5, 1), _draft(6, 2)]
+    assert _shape(_merge_small_chunks(chunks, 30)) == [111]
+
+
+def test_开头的连续短块并进下一个():
+    chunks = [_draft(5, 0), _draft(6, 1), _draft(100, 2)]
+    assert _shape(_merge_small_chunks(chunks, 30)) == [111]
+
+
+def test_整篇只有短块时合成一个而不是全丢():
+    assert _shape(_merge_small_chunks([_draft(5, 0), _draft(6, 1)], 30)) == [11]
+
+
+def test_没有短块时原样返回():
+    chunks = [_draft(100, 0), _draft(200, 1)]
+    assert _merge_small_chunks(chunks, 30) == chunks
+
+
+def test_合并把段拼起来而不是丢掉():
+    merged = _merge_small_chunks([_draft(100, 0), _draft(5, 1)], 30)
+
+    assert len(merged) == 1
+    assert len(merged[0].segments) == 2
+
+
+def test_合并后行区间连续():
+    merged = _merge_small_chunks([_draft(5, 0), _draft(100, 1), _draft(5, 2)], 30)
+
+    assert _shape(merged) == [110]  # 末尾那个短块并进上一个
+    assert (merged[0].start_line, merged[0].end_line) == (0, 2)
+
+
+def test_不传min_token时不做合并(tmp_path):
+    """默认行为不变：短块照样单独成 chunk。"""
+    md = f"# 标题\n\n{_paras(30)}\n\n# 尾\n\n短。\n"
+    drafts = chunk_by_title(_write(tmp_path, md), max_token=60, start_line=0)
+
+    assert min(d.tokens for d in drafts) < 30
+
+
+def test_传min_token后短块被并进邻居(tmp_path):
+    md = f"# 标题\n\n{_paras(30)}\n\n# 尾\n\n短。\n"
+    drafts = chunk_by_title(_write(tmp_path, md), max_token=60, start_line=0, min_token=30)
+
+    assert all(d.tokens >= 30 for d in drafts)
+
+
+def test_开头的短块并进下一个chunk(tmp_path):
+    """文档以一小段正文开头、后面跟超长正文时，开头那段会被单独 flush 出来。"""
+    md = "前导一小段。\n\n# 标题\n\n" + "甲" * 300 + "\n"
+    drafts = chunk_by_title(_write(tmp_path, md), max_token=60, start_line=0, min_token=30)
+
+    assert all(d.tokens >= 30 for d in drafts)
+    assert "前导一小段" in _text(drafts[0])
+    assert "甲" in _text(drafts[0])
+
+
+def test_整篇只有一个短块时返回空列表(tmp_path):
+    drafts = chunk_by_title(
+        _write(tmp_path, "# 标题\n"), max_token=1000, start_line=0, min_token=30
+    )
+
+    assert drafts == []
