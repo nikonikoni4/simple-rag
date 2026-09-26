@@ -5,24 +5,40 @@
 1. 数据清洗
 2. 递归构建md结构树(结构+每个节点的预估token数，需要一个计算token的工具函数)
 3. 判断标题是否有错误(跳级，从# -> ### 等)->警告但继续按照策略进行
-4. 切分chuak：(策略可选择，为了用于对比)
-    1)表格代码等内容块查询,作为一个单独的子块
-    2)文档超出退回
-    
-5. chunk并行Embedding 需要拼接前缀、特殊块的summary
-6. 存入向量数据库(依赖注入)
+4. 对文档中的表格/代码块并发总结(总结函数由调用方注入，单个失败只 warning)
+5. 切分策略
+1）有标题的情况：
+    “添加节点” ： 添加该节点的正文+所有子节点内容
+    “添加正文”：只添加该节点的正文
+    a. 从最顶层开始，判断相加是否超过max_token: 
+        递归添加过程
+        def 正文切割方法():... 
+        chunk_list = []
+        cur_token = 0
+        def 切割(file_head:MDFileHead):
+            nonlocal current_token
+            if not MDFileHead:
+                return 
+            # 先添加正文
+            cur_token += file_head.
+        直到
 """
 
 
+import logging
 import re
-from dataclasses import dataclass
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from .types import ChunkDraft, MDFileHead, SpecialContent
+from .types import ChunkDraft, MDFileHead, Segment, SpecialContent
 
 # markdown 标题行：1~6 个 # 加空白再加标题文本
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+# CJK 字符（`_count_token` 按它区分计费档位，单独抽出来给逐行累加复用）
+_CJK_RE = re.compile(r"[一-鿿]")
 
 def _clean_file_content(content:str)->str:
     """清洗原文：去掉每行行尾空格，并把连续空行收敛成一行。
@@ -54,7 +70,7 @@ def _count_token(text: str) -> int:
         估算的 token 数。CJK 字符按 1 token，其余字符按约 4 字符 1 token。
         因此日文假名、韩文谚文会落到「非 CJK」那一边（当前语料是中文，可忽略）。
     """
-    cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
+    cjk = len(_CJK_RE.findall(text))
     return cjk + (len(text) - cjk) // 4
 
 
@@ -117,6 +133,10 @@ def _fill_tokens(node: MDFileHead) -> None:
 
     Args:
         node: 子树根。原地修改，不返回新对象。
+
+    Note:
+        只统计 `content`，**不含特殊块摘要** —— 摘要是第 4 步才生成的独立字段。
+        理由见 `chunk_by_title` 的 Note。
     """
     node.content_token = _count_token(node.content)
     node.child_token = 0
@@ -125,18 +145,24 @@ def _fill_tokens(node: MDFileHead) -> None:
         node.child_token += child.total_tokens
     node.total_tokens = node.content_token + node.child_token
 
-# ---------------------------------------------------------------- 第 4 步：切分
+
+# --------------------------------------------------- 第 4 步：识别特殊块 + 并发总结
 #
 # 顺序：
 #   1) 定位行号 —— 前序累计每个节点占多少行，**行号在这里才确定**，不进 dataclass
 #   2) 识别特殊块 —— 代码块 / 表格挂到节点的 special_content（事实层，与策略无关）
-#   3) 装箱 —— 整棵子树装得下就一个 chunk；装不下就下钻，逐个节点往里加
-#   4) 正文超限 —— 对正文切开，但切点避开代码块和表格
+#   3) 并发总结 —— 把待总结的块交给调用方注入的 summary_func，单个失败只 warning
 
 
 _FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
 _TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
 _TABLE_SEP_RE = re.compile(r"^\s*\|[\s:|-]+\|\s*$")
+# 句末标点：一行自己超预算时就近切在它们后面
+_PUNCT_RE = re.compile(r"[。！？；!?;]")
+
+# 并发总结的线程数。总结是网络 IO，所以用线程而不是进程。写死是因为
+# 「缺了它模块照样能工作」—— 真需要调并发是调用方的事。
+_SUMMARY_MAX_WORKERS = 4
 
 
 @dataclass
@@ -149,37 +175,11 @@ class _Block:
         kind: 块类型。`code` / `table` 不可从中间切开，`text` 可以。
         start: 起始行偏移（闭区间，含）。
         end: 结束行偏移（闭区间，含）。
-        tokens: 块的 token 量预估。
     """
 
     kind : Literal["code", "table", "text"]
     start : int  # 在所属节点 content 内的行偏移（0-based，闭区间）
     end : int
-    tokens : int
-
-
-@dataclass
-class _Seg:
-    """渲染片段。一个 chunk 由若干连续片段拼成。
-
-    与 `_Block` 的分工：`_Block` 是「节点内的行偏移」，`_Seg` 是「已换算成全局
-    行号、可以直接渲染的文本」。
-
-    Attributes:
-        pref: 该片段自己的面包屑，渲染时逐片段注入。
-        text: 片段正文（可能只是节点 `content` 的一部分）。
-        start_line: 起始行（闭区间，全局）。
-        end_line: 结束行（闭区间，全局）。
-        tokens: 片段 token 量。
-        special_content: 落在本片段内的代码块 / 表格。
-    """
-
-    pref : str
-    text : str
-    start_line : int
-    end_line : int
-    tokens : int
-    special_content : list[SpecialContent]
 
 
 def _locate_spans(root: MDFileHead) -> dict[int, tuple[int, int]]:
@@ -268,13 +268,13 @@ def _parse_blocks(lines: list[str]) -> list[_Block]:
                     break
                 j += 1
             end = min(j, total - 1)
-            blocks.append(_Block("code", i, end, _count_token("\n".join(lines[i : end + 1]))))
+            blocks.append(_Block("code", i, end))
             i = end + 1
         elif _is_table_start(lines, i):
             j = i
             while j + 1 < total and _TABLE_ROW_RE.match(lines[j + 1]) is not None:
                 j += 1
-            blocks.append(_Block("table", i, j, _count_token("\n".join(lines[i : j + 1]))))
+            blocks.append(_Block("table", i, j))
             i = j + 1
         elif lines[i].strip() == "":
             i += 1
@@ -287,7 +287,7 @@ def _parse_blocks(lines: list[str]) -> list[_Block]:
                 and not _is_table_start(lines, j + 1)
             ):
                 j += 1
-            blocks.append(_Block("text", i, j, _count_token("\n".join(lines[i : j + 1]))))
+            blocks.append(_Block("text", i, j))
             i = j + 1
     return blocks
 
@@ -300,6 +300,11 @@ def _fill_special(node: MDFileHead, spans: dict[int, tuple[int, int]]) -> None:
     Args:
         node: 子树根。原地写 `special_content`，并递归到所有子节点。
         spans: `_locate_spans` 的结果，用来把节点内偏移换算成全局行号。
+
+    Note:
+        本函数是**整段重写** `node.special_content`，所以对同一棵树再调一次会把
+        已经写好的 `summary` 全部抹掉。总结只在这里做一次，下游（切分）请直接复用
+        结果，不要重新 fill。
     """
     lines = node.content.splitlines()
     base = spans[id(node)][0]
@@ -317,200 +322,478 @@ def _fill_special(node: MDFileHead, spans: dict[int, tuple[int, int]]) -> None:
         _fill_special(child, spans)
 
 
-def _seg_of_node(node: MDFileHead, spans: dict[int, tuple[int, int]]) -> _Seg:
-    """把一个节点**自己**的正文（不含子节点）包成渲染片段。
+def _collect_specials(root: MDFileHead) -> list[SpecialContent]:
+    """前序遍历整棵树，收集**还没有摘要**的特殊块（表格 / 代码块）。
+
+    这是「先找出需要总结的」那一步，在主线程里一次收完，不占线程池。
 
     Args:
-        node: 目标节点。
-        spans: `_locate_spans` 的结果。
+        root: 虚拟根节点，`special_content` 需已由 `_fill_special` 填好。
 
     Returns:
-        覆盖该节点整段 `content` 的片段。`special_content` 做了浅拷贝，
-        避免之后被重新识别改写。
+        按阅读顺序排列的 `SpecialContent` 列表。返回的是**原对象**而非拷贝 ——
+        并发总结时直接原地写回它们的 `summary`。
+    """
+    out: list[SpecialContent] = []
+
+    def walk(node: MDFileHead) -> None:
+        """前序收集本节点的待总结块，再递归子节点。"""
+        out.extend(block for block in node.special_content if block.summary is None)
+        for child in node.child_head:
+            walk(child)
+
+    walk(root)
+    return out
+
+
+def _summarize_specials(
+    blocks: list[SpecialContent], summary_func: Callable[[str], str]
+) -> None:
+    """并发调用 `summary_func`，把结果写回各块的 `summary`。
+
+    `with` 退出时会 `shutdown(wait=True)`，所以所有块跑完才返回 —— 也就是
+    「并发执行，然后 wait」。写回的是各块自己的对象，**与完成顺序无关**，
+    因此结果和串行执行完全一致。
+
+    单个块失败只记 warning，不向外抛：一批里坏掉一个不该让整篇文档失败。
+    该块的 `summary` 保持 `None`，其余块不受影响。
+
+    Args:
+        blocks: `_collect_specials` 的产物，原地写 `summary`。
+        summary_func: 调用方注入的总结函数，入参是块的原文，返回摘要文本。
+    """
+    if not blocks:
+        return
+    workers = min(_SUMMARY_MAX_WORKERS, len(blocks))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(summary_func, block.content): block for block in blocks}
+        for future in as_completed(futures):
+            block = futures[future]
+            try:
+                block.summary = future.result()
+            except Exception:
+                # 只 warning 不抛：异常本身可预期（网络抖动 / 内容触发风控等），
+                # 一个块坏掉不该让整篇文档总结失败。
+                logging.warning(
+                    "特殊块总结失败，已跳过（content_type=%s, 行 %d-%d）",
+                    block.content_type,
+                    block.start_line,
+                    block.end_line,
+                    exc_info=True,
+                )
+
+
+# 重叠区占 max_token 的比例。注释里说取 10%~20%,这里取中间值。
+_OVERLOP_RATIO = 0.15
+
+
+def _seg_of_node(node: MDFileHead, spans: dict[int, tuple[int, int]]) -> Segment:
+    """把一个节点**自己**的正文（不含子节点）包成 `Segment`。
+
+    `special_content` 用**节点上原来那批对象**（第 4 步填的），不重新造 ——
+    摘要在那些对象上，造新的就把它丢了。
     """
     start, end = spans[id(node)]
-    return _Seg(node.pref, node.content, start, end, node.content_token, list(node.special_content))
+    return Segment(
+        pref=node.pref,
+        text=node.content,
+        start_line=start,
+        end_line=end,
+        tokens=node.content_token,
+        special_content=list(node.special_content),
+    )
 
 
-def _subtree_segs(node: MDFileHead, spans: dict[int, tuple[int, int]]) -> list[_Seg]:
-    """把整棵子树按阅读顺序展开成片段列表。
-
-    Args:
-        node: 子树根。
-        spans: `_locate_spans` 的结果。
-
-    Returns:
-        前序展开的片段列表。`content` 为空的节点不产出片段。
-    """
+def _subtree_segs(node: MDFileHead, spans: dict[int, tuple[int, int]]) -> list[Segment]:
+    """把整棵子树按阅读顺序（前序）展开成片段列表。`content` 为空的节点不产出片段。"""
     segs = [_seg_of_node(node, spans)] if node.content else []
     for child in node.child_head:
         segs.extend(_subtree_segs(child, spans))
     return segs
 
 
-def _render(segs: list[_Seg]) -> ChunkDraft:
-    """把若干连续片段拼成一个 chunk。
+@dataclass
+class _CutHelper:
+    """当前正在攒的那个 chunk 的累加器。跨节点累积，结算后清空复用。
 
-    面包屑按**每个片段各自**注入，所以多个标题合进同一个 chunk 也不会串。
+    只攒 `Segment`，**不拼成字符串** —— 面包屑、行号、原文都留在段上，
+    什么时候拼、拼不拼摘要，由调用方在 `Segment.render` / `render_text` 那里决定。
+
+    Attributes:
+        segments: 已并入的片段，按阅读顺序。
+        tokens: 已并入片段的 token 之和。
+    """
+
+    segments : list[Segment] = field(default_factory=list)
+    tokens : int = 0
+
+    def add_seg(self, seg: Segment) -> None:
+        """并入一个片段。"""
+        self.segments.append(seg)
+        self.tokens += seg.tokens
+
+    def to_draft(self, file_path: str) -> ChunkDraft:
+        """结算成 `ChunkDraft`。行区间和 `special_content` 由它自己从 segments 推。"""
+        return ChunkDraft(
+            segments=list(self.segments),
+            file_path=file_path,
+            tokens=self.tokens,
+        )
+
+    def reset(self) -> None:
+        """清空，准备下一个 chunk。"""
+        self.segments = []
+        self.tokens = 0
+
+
+def _overlop_start(
+    lines: list[str], blocks: list[_Block], cut_at: int, overlop: int
+) -> int:
+    """从切点往回数 `overlop` 个 token，算出下半段该从哪一行重新开始（行下标）。
+
+    回溯出来的这一段就是**重叠区** —— 它已经随上半段切走了，下半段再留一份，
+    跨切点的内容从上下两个 chunk 都能召回。
+
+    回溯的起点要同时满足两件事：
+
+    - **不从特殊块中间断开**：起点落在代码块 / 表格内部时**向前跳过整个块**。
+      重叠区宁可没有，也不留在下半段的头部 —— 少一个开围栏的代码块，会让下半段
+      的块识别整个错位（` ``` ` 被当成普通文本、闭合围栏被当成新开围栏）。
+      （往回退到块首是不行的：块首正好是切出去那段的开头，下半段会还原成全文。）
+    - **必须真的推进**：起点退到 0 等于下半段还原成全文，切分会原地踏步。
+      这时放弃重叠，下半段直接从切点开始。
 
     Args:
-        segs: 按阅读顺序排列的连续片段，不能为空。
+        lines: 当前（剩余）内容的行列表。
+        blocks: `_parse_blocks(lines)` 的结果。
+        cut_at: 切点（行下标，左闭右开）。
+        overlop: 重叠区目标 token 数。
 
     Returns:
-        拼好的 `ChunkDraft`。行区间取首尾片段；`tokens` 为各片段之和；
-        `special_content` 汇总各片段里的代码块 / 表格。
+        下半段的新起始行下标，恒 `<= cut_at`。
     """
-    parts = [f"{seg.pref}\n{seg.text}" if seg.pref else seg.text for seg in segs]
-    return ChunkDraft(
-        original_content="\n\n".join(parts),
-        start_line=segs[0].start_line,
-        end_line=segs[-1].end_line,
-        tokens=sum(seg.tokens for seg in segs),
-        special_content=[s for seg in segs for s in seg.special_content],
-    )
+    if overlop <= 0 or cut_at <= 0:
+        return cut_at
+    acc = 0
+    i = cut_at
+    while i > 0 and acc < overlop:
+        acc += _count_token(lines[i - 1])
+        i -= 1
+    # 起点落在硬边界内部 -> 向前跳过整个块（块的下一行就是块尾 + 1）。
+    # `text` 不算，切在一段普通正文中间没有问题
+    for blk in blocks:
+        if blk.kind in ("code", "table") and blk.start < i <= blk.end:
+            i = blk.end + 1
+            break
+    # 没有可用重叠：退到 0 或抵到切点，都会让下半段不推进或还原成全文
+    if i <= 0 or i >= cut_at:
+        return cut_at
+    return i
 
 
-def _split_content(node: MDFileHead, max_token: int, spans: dict[int, tuple[int, int]]) -> list[ChunkDraft]:
-    """节点正文自己就超限时，按块装箱切成多段。
+def _cut_point(
+    lines: list[str], blocks: list[_Block], max_token: int
+) -> tuple[int, bool]:
+    """按 token 预算找切点（行下标，左闭右开），返回 `(切点, 是否因特殊块回退)`。
 
-    切点只落在软边界（文本块之间）。代码块 / 表格**不从中间切开** —— 它自己
-    就超限时，允许这一段超限，整体保留。
+    逐行走、逐行累加，所以**普通正文可以被从中间切开** —— `_Block` 里 `text` 是软边界。
+    代码块和表格是硬边界：预算点落在它们内部时回退到块首。
+
+    切点只保证 `>= 1`，不保证不超限：第一行自己就超预算，或者某个块从第 0 行开始
+    且整块超预算时，退无可退，只能整块拿走 —— 这是 `max_token` 标「软约束」的实际含义。
 
     Args:
-        node: 正文超限的节点。
-        max_token: 单段的 token 上限（软约束，会被不可切的块突破）。
-        spans: `_locate_spans` 的结果。
+        lines: 行列表。
+        blocks: `_parse_blocks(lines)` 的结果。
+        max_token: 单段 token 上限。
 
     Returns:
-        切好的 `ChunkDraft` 列表，按阅读顺序排列。每段都带上该节点的面包屑。
+        `(切点, 是否回退过)`。第二个值用来决定「还留不留重叠」。
     """
-    lines = node.content.splitlines()
-    base = spans[id(node)][0]
-    drafts: list[ChunkDraft] = []
-    cur: list[_Block] = []
-    cur_tokens = 0
+    # 逐行累加，口径必须和 `_count_token("\n".join(lines[:i]))` 完全一致 ——
+    # 包括行与行之间那个换行符。否则这里算出的预算和 `ChunkDraft.tokens` 会对不上，
+    # `tokens` 会systematically 超出 max_token
+    cjk = 0
+    width = 0
+    got_content = False  # 是否已经吃到过非空行
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        cjk += len(_CJK_RE.findall(line))
+        width += len(line) + (1 if i else 0)  # 行间的 "\n"
+        over = cjk + (width - cjk) // 4 > max_token
+        # 超预算就停在上一行 —— 但**只有已经吃到正文才算停**。
+        # 否则文档以空行开头时，切点会落到只含空行的位置，切出一段空文本
+        if over and got_content:
+            break
+        if line.strip():
+            got_content = True
+        i += 1
+    for blk in blocks:
+        # 只有代码块 / 表格是硬边界；`text` 可以被切在任何一行
+        if blk.kind in ("code", "table") and blk.start < i <= blk.end:
+            # 退到块首；块首就是第 0 行时退无可退，整块拿走
+            return (blk.end + 1, True) if blk.start == 0 else (blk.start, True)
+    return i, False
 
-    def flush() -> None:
-        """把已攒的块结算成一段 chunk，并清空缓冲。"""
-        nonlocal cur, cur_tokens
-        if not cur:
-            return
-        start, end = cur[0].start, cur[-1].end
-        line_start, line_end = base + start, base + end
-        drafts.append(
-            ChunkDraft(
-                original_content=(f"{node.pref}\n" if node.pref else "")
-                + "\n".join(lines[start : end + 1]),
-                start_line=line_start,
-                end_line=line_end,
-                tokens=cur_tokens,
+
+def _take_by_budget(text: str, max_token: int) -> int:
+    """从 `text` 开头尽量多取字符，使估算 token 不超过 `max_token`。
+
+    口径和 `_count_token` 一致（CJK 按 1 个、其余按 4 字符 1 个，逐字符累加）。
+
+    Args:
+        text: 待切文本。
+        max_token: token 上限。
+
+    Returns:
+        能取的字符数，`1 <= 返回值 <= len(text)` —— 第一个字符就超预算时也得取一个，
+        否则切点不推进。
+    """
+    cjk = 0
+    for i, ch in enumerate(text):
+        if _CJK_RE.match(ch):
+            cjk += 1
+        width = i + 1
+        if i and cjk + (width - cjk) // 4 > max_token:
+            return i
+    return len(text)
+
+
+def _in_line_cut(line: str, max_token: int) -> int:
+    """在一行**内部**找切点（字符偏移，左闭右开）。
+
+    **标点优先**：取预算内最靠后的句末标点之后切开 —— 每片尽量接近上限，
+    又不把句子劈断。可用的标点一个都没有时**直接按字符硬切**。
+
+    Args:
+        line: 待切的那一行。
+        max_token: 这一行能用的 token 预算。
+
+    Returns:
+        切点字符偏移，恒 `1 <= 返回值 < len(line)`（调用前必须先确认这一行本身超预算）。
+    """
+    limit = _take_by_budget(line, max_token)
+    best = 0
+    for matched in _PUNCT_RE.finditer(line, 0, limit + 1):
+        best = matched.end()
+    return best if best else limit
+
+
+def _in_line_back(line: str, cut: int, overlop: int) -> int:
+    """行内切的重叠起点：从 `cut` 往回数 `overlop` 个 token，返回字符偏移。
+
+    Args:
+        line: 被切的那一行。
+        cut: 切点（字符偏移）。
+        overlop: 重叠区目标 token 数。
+
+    Returns:
+        重叠起点的字符偏移；`0` 表示退到头了（调用方此时应当放弃重叠，
+        否则下半段会等于原文、切分原地踏步）。
+    """
+    cjk = 0
+    for i in range(cut - 1, -1, -1):
+        if _CJK_RE.match(line[i]):
+            cjk += 1
+        width = cut - i
+        if cjk + (width - cjk) // 4 >= overlop:
+            return i
+    return 0
+
+
+def content_cut(
+    cut_helper:_CutHelper,
+    file_head:MDFileHead,
+    base_line:int,
+    base_col:int,
+    max_token:int,
+    overlop:int|None=None,
+) -> tuple[int, int]:
+    """把一个节点**自己**的正文切一刀：上半段进 `cut_helper`，下半段原地留下。
+
+    调用前提：`cut_helper` 是空的。
+
+    切点这样选：
+
+    1. 按 token 预算**逐行**推进，正文可以切在任意**行边界**
+    2. **一行自己就超过 `max_token`** 时，改在这一行**内部**切：优先落在句末标点之后，
+       一个可用标点都没有就按字符硬切（见 `_in_line_cut`）
+    3. 代码块和表格是硬边界，切点落进去就回退到块首；整块自己就超预算时整块拿走、
+       允许这一段超限，否则切点无法推进（原地死循环）
+
+    下半段会**头部回溯** `overlop` 个 token，形成与上半段的重叠区。
+    正文全部装得下时一次拿完、不留剩余，也就不产生重叠。
+
+    Args:
+        cut_helper: 累加器，上半段并进这里。
+        file_head: 待切的节点。**原地改它的 `content`**，删掉已切走的上半段。
+        base_line: `file_head.content` 首字符所在行在**清洗后全文**里的行号。
+        base_col: 该行内的字符偏移 —— 上一刀切在行内时不为 0。
+        max_token: 单段 token 上限（软约束）。
+        overlop: 重叠区 token 数；`None` 表示按 `_OVERLOP_RATIO` 从 `max_token` 推。
+
+    Returns:
+        下半段的**新起点** `(行号, 行内偏移)`。
+    """
+    if overlop is None:
+        overlop = max(1, int(max_token * _OVERLOP_RATIO))
+    content = file_head.content
+    lines = content.splitlines()
+    blocks = _parse_blocks(lines)
+    if not blocks:
+        file_head.content = ""
+        return base_line, base_col
+
+    # 各行在 content 里的起始偏移（末尾再放一个哨兵），用来在「行下标」和「字符偏移」
+    # 之间换算 —— 行内切只有字符偏移表达得了
+    line_starts: list[int] = []
+    offset = 0
+    for item in lines:
+        line_starts.append(offset)
+        offset += len(item) + 1
+    line_starts.append(len(content))
+
+    def _emit(cut_text: str, cut_end: int) -> None:
+        """把上半段并进累加器。`special_content` 从节点原来那批对象里筛，
+        这样摘要（第 4 步挂在对象上）能跟着进 chunk，不会被重新造的对象丢掉。"""
+        cut_helper.add_seg(
+            Segment(
+                pref=file_head.pref,
+                text=cut_text,
+                start_line=base_line,
+                end_line=cut_end,
+                tokens=_count_token(cut_text),
                 special_content=[
                     s
-                    for s in node.special_content
-                    if s.start_line >= line_start and s.end_line <= line_end
+                    for s in file_head.special_content
+                    if (s.start_line > base_line or base_col == 0)
+                    and base_line <= s.start_line
+                    and s.end_line <= cut_end
                 ],
             )
         )
-        cur, cur_tokens = [], 0
 
-    for blk in _parse_blocks(lines):
-        if cur and cur_tokens + blk.tokens > max_token:
-            flush()
-        cur.append(blk)
-        cur_tokens += blk.tokens
-    flush()
-    return drafts
+    # 1. 第一条非空行；它自己就超过预算时走**行内切**
+    first = next((i for i, item in enumerate(lines) if item.strip()), len(lines))
+    in_hard_block = any(
+        blk.kind in ("code", "table") and blk.start <= first <= blk.end for blk in blocks
+    )
+    if first < len(lines) and not in_hard_block and _count_token(lines[first]) > max_token:
+        line = lines[first]
+        cut_col = _in_line_cut(line, max_token)
+        cut_offset = line_starts[first] + cut_col
+        # 切了 n 个换行就到第 base_line + n 行；这一刀落在行内，所以是 first
+        _emit(content[:cut_offset], base_line + first)
+        back = _in_line_back(line, cut_col, overlop)
+        # back 退到 0 就等于下半段还原成原文，这时放弃重叠，只保证有推进
+        new_content = content[cut_offset:] if back <= 0 else content[line_starts[first] + back :]
+        file_head.content = new_content
+        return (base_line + first, 0) if back <= 0 else (base_line + first, back)
 
+    # 2. 常规路径：按行边界切。落进特殊块就回退，所以不会把代码块 / 表格劈开
+    cut_at, pulled_back = _cut_point(lines, blocks, max_token)
+    _emit("\n".join(lines[:cut_at]), base_line + cut_at - 1)
 
-def _pack(
-    node: MDFileHead,
-    max_token: int,
-    spans: dict[int, tuple[int, int]],
-    out: list[ChunkDraft],
-) -> None:
-    """从 `node` 往下装箱，把子树填成若干 chunk。
+    # 3. 全拿完了就没有剩余，也没有重叠可言
+    if cut_at >= len(lines):
+        file_head.content = ""
+        return base_line, base_col
 
-    规则：
-
-    1. 整棵子树装得下 -> 直接一个 chunk
-    2. 装不下 -> 先放本节点正文，再按阅读顺序逐个往里加子节点
-    3. 加不下就结算当前 chunk，从下一个子节点重新开一个
-    4. 子节点自己就超限 -> 下钻递归；到最下层正文还超限则交给 `_split_content`
-
-    Args:
-        node: 当前子树根。
-        max_token: 单个 chunk 的 token 上限（软约束）。
-        spans: `_locate_spans` 的结果。
-        out: 结果累加到这里，按阅读顺序追加。原地修改，不返回。
-    """
-    if 0 < node.total_tokens <= max_token:
-        out.append(_render(_subtree_segs(node, spans)))
-        return
-
-    buf: list[_Seg] = []
-    buf_tokens = 0
-
-    def flush() -> None:
-        """把已攒的片段结算成一个 chunk，并清空缓冲。"""
-        nonlocal buf, buf_tokens
-        if buf:
-            out.append(_render(buf))
-            buf, buf_tokens = [], 0
-
-    # 本节点正文在子节点之前
-    if node.content:
-        if node.content_token <= max_token:
-            buf.append(_seg_of_node(node, spans))
-            buf_tokens += node.content_token
-        else:
-            flush()
-            out.extend(_split_content(node, max_token, spans))
-
-    for child in node.child_head:
-        if child.total_tokens > max_token:
-            flush()
-            _pack(child, max_token, spans, out)
-            continue
-        if buf and buf_tokens + child.total_tokens > max_token:
-            flush()
-        buf.extend(_subtree_segs(child, spans))
-        buf_tokens += child.total_tokens
-    flush()
+    # 4. 下半段原地留下。
+    #    切点是被特殊块顶回来的话**不留重叠**：否则下半段会从重叠处再切一次、又退到
+    #    同一个切点，切出一块被上一块完全包住的重复 chunk。
+    back = cut_at if pulled_back else _overlop_start(lines, blocks, cut_at, overlop)
+    file_head.content = content[line_starts[back] :]
+    return base_line + back, 0
 
 
-def _cut_chunks(tree: MDFileHead, max_token: int) -> list[ChunkDraft]:
-    """按标题切分整棵树。
+def cut(
+    root:MDFileHead,
+    max_token:int,
+    file_path:str,
+    overlop:int|None=None,
+)->list[ChunkDraft]:
+    """按标题把整棵树切成 chunk。
+
+    切割策略:
+        1. 尽量保持同一个节点内容在同一个chunk内 —— 整棵子树装得下就先整块并入
+        2. 多个节点如果能够放入一个chunk则放入，若再添加下一个节点无法放入，则放弃下一个节点
+        3. 若当前chunk只有一个节点，且正文内容超长需要切割，则需要进行overlop和特殊块保护，
+           若当前有多个节点，参考2，放弃该节点进入当前chunk
 
     Args:
-        tree: `_build_file_tree` 产出的树（虚拟根）。
-        max_token: 单个 chunk 的 token 上限（软约束）。
+        root: `_build_file_tree` 产出的树（虚拟根），`special_content` 需已填好。
+        max_token: 单个 chunk 的 token 上限（软约束，不可切的块会突破）。
+        file_path: 来源文件路径，原样写进每个 `ChunkDraft`。它直接参与 `chunk_id`，
+            所以传相对路径才能让 ID 跨机器可移植。
+        overlop: 重叠区 token 数，透传给 `content_cut`。
 
     Returns:
         按阅读顺序排列的 `ChunkDraft` 列表。整篇装得下时只返回一个。
-
-    Note:
-        可能产出 `tokens == 0` 的碎片（例如单独一行的零宽字符），当前**未过滤** ——
-        需要的话在这里加一道筛选。
     """
-    spans = _locate_spans(tree)
-    _fill_special(tree, spans)
-    out: list[ChunkDraft] = []
-    _pack(tree, max_token, spans, out)
-    return out
+    spans = _locate_spans(root)
+    chunk_list: list[ChunkDraft] = []
+    cut_helper = _CutHelper()
+
+    def flush() -> None:
+        """把累加器里的段结算成一个 chunk，并清空。"""
+        if not cut_helper.segments:
+            return
+        chunk_list.append(cut_helper.to_draft(file_path))
+        cut_helper.reset()
+
+    def _cut(file_head:MDFileHead):
+        if file_head is None:
+            return
+
+        # 策略 1：整棵子树装得下 -> 优先整块并入当前 chunk
+        if 0 < file_head.total_tokens <= max_token:
+            if cut_helper.segments and cut_helper.tokens + file_head.total_tokens > max_token:
+                flush()
+            for seg in _subtree_segs(file_head, spans):
+                cut_helper.add_seg(seg)
+            return
+
+        # 装不下 -> 先放本节点正文，再按顺序下钻子节点
+        if file_head.content:
+            if file_head.content_token <= max_token and (
+                not cut_helper.segments
+                or cut_helper.tokens + file_head.content_token <= max_token
+            ):
+                cut_helper.add_seg(_seg_of_node(file_head, spans))
+            else:
+                # 策略 3：正文自己就超限 -> 切开，循环到切完为止
+                flush()
+                base_line = spans[id(file_head)][0]
+                base_col = 0
+                while file_head.content:
+                    base_line, base_col = content_cut(
+                        cut_helper, file_head, base_line, base_col, max_token, overlop
+                    )
+                    flush()
+
+        for child in file_head.child_head:
+            _cut(child)
+
+    _cut(root)
+    flush()
+    return chunk_list
 
 
-
-
-def chunk_by_title(file_path:Path,max_token,start_line,end_line=None)->list[ChunkDraft]:
+def chunk_by_title(file_path:Path,max_token,start_line,end_line=None,summary_func:Callable[[str], str]|None = None)->list[ChunkDraft]:
     """按标题把一个 Markdown 文件切成 chunk 草稿。
 
-    流程：读取文件 -> 按行切片 -> 清洗 -> 建标题树 -> 切分。
+    流程：读取文件 -> 按行切片 -> 清洗 -> 建标题树 -> 并发总结特殊块 -> 切分。
 
     Args:
         file_path: Markdown 文件路径，按 UTF-8 读取。
         max_token: 单个 chunk 的 token 上限（软约束，不可切的块会突破）。
         start_line: 起始行（0-based，左闭）。
         end_line: 结束行（0-based，**右开**）；`None` 表示读到文件末尾。
+        summary_func: 总结函数，入参是代码块 / 表格的原文，返回摘要文本。
+            **由调用方注入**，本模块不绑定任何模型服务。传 `None` 则整步跳过，
+            各块的 `summary` 保持 `None`。单个块抛异常只记 warning，不影响其余块。
 
     Returns:
         按阅读顺序排列的 `ChunkDraft` 列表。
@@ -519,6 +802,21 @@ def chunk_by_title(file_path:Path,max_token,start_line,end_line=None)->list[Chun
         第 4 步之后的行号是相对**清洗后**文本的；叠加这里的切片偏移后，它已经
         不等于原文件行号。要精确回溯原文需要额外维护映射 —— `_clean_file_content`
         会吃掉连续空行，所以映射不是简单加一个偏移量。
+
+        **`max_token` 是软约束**，有三种情况会被突破：代码块 / 表格不从中间切开，
+        超长单行不切行内（切分是行级的），以及整块拿不下时的退让。真实语料上
+        （`data/lifeprismData`，938 个 chunk）约 2.9% 超限，全部是超长单行。
+
+        **`max_token` 不含特殊块摘要。** 摘要和面包屑一样是独立字段，不插进
+        `original_content`，只在算 embedding 时才拼进去（见 `types.py`）。所以送进
+        embedding 的文本比 `max_token` 多出「本 chunk 内特殊块摘要之和」。设
+        `max_token` 时请自行留余量。
+
+        之所以不在切分时把摘要算进去：摘要由外部服务生成、失败只 warning，
+        一旦它参与 `total_tokens`，同一份文件就会因为一次网络抖动切出不同的
+        `start_line`/`end_line`，`chunk_id` 的位置寻址幂等性随之失效。若将来
+        实测确有必要，做法是给 `SpecialContent` 加 `token` 字段、总结后回填，
+        再重算一次 `total_tokens`（注意那会让切分结果依赖服务可用性）。
     """
     # 1. 读取文件
     content = file_path.read_text(encoding='utf-8')
@@ -528,8 +826,16 @@ def chunk_by_title(file_path:Path,max_token,start_line,end_line=None)->list[Chun
     clean_content = _clean_file_content(content)
     # 3. 构建文档树
     filetree = _build_file_tree(clean_content)
-    # 4. 切分
-    return _cut_chunks(filetree, max_token)
+    # 4. 识别特殊块(表格/代码块)。这一步**总要跑** —— special_content 是事实层,
+    #    第 5 步切分要靠它保护特殊块、并把摘要带进 chunk,不只是为了总结
+    _fill_special(filetree, _locate_spans(filetree))
+    # 4.1 并发总结。先收集待总结的,再并发跑,全部结束后返回;单个失败只 warning。
+    #     summary_func 为 None 时跳过(此时 special_content 照样填好,只是没有摘要)
+    if summary_func is not None:
+        _summarize_specials(_collect_specials(filetree), summary_func)
+
+    # 5. 切分
+    return cut(filetree, max_token, str(file_path))
 
 if __name__ =="__main__":
     file_path = Path(r"D:\desktop\软件开发\RAG\data\lifeprismData\diary\2025\01\2025-01-16.md")
