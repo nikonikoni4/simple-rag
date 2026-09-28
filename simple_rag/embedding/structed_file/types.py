@@ -7,7 +7,7 @@
 - `SpecialContent` —— 需保护、不能从中间切开的块（代码 / 表格）
 - `Segment` —— chunk 里的一段：纯正文 + 它自己的面包屑 + 行区间
 - `ChunkDraft` —— 切分产物，还没有 `embedding_vec`（第 5 步填）
-- `Chunk` —— 最终产物，带 `embedding_vec`，可直接交给 `VecStore`
+- `Chunk` —— 最终产物，带 `embedding_vec`，可直接交给 `VecDB`
 
 **面包屑和摘要都不写进 `Segment.text`**，它们是独立字段：存的时候分开存，
 要用的时候（算 embedding、给 agent 看）才由 `Segment.render` 拼起来。
@@ -181,7 +181,7 @@ class ChunkDraft:
 
 @dataclass
 class Chunk:
-    """最终产物：一段可入库的 chunk。可直接交给 `VecStore.insert`。
+    """最终产物：一段可入库的 chunk。可直接交给 `VecDB.insert`。
 
     Attributes:
         segments: 同 `ChunkDraft.segments`。

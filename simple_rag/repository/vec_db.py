@@ -1,4 +1,4 @@
-"""`VecStore` —— 向量存储的唯一对外类。
+"""`VecDB` —— 向量存储的唯一对外类。
 
 持有连接、Schema 与事务控制。**它不认识任何业务概念。**
 
@@ -41,7 +41,7 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-class VecStore:
+class VecDB:
     """一个 `.db` 文件一个实例。
 
     **不加 `check_same_thread=False`** —— 保持 Python 默认的线程亲和性，
@@ -52,7 +52,7 @@ class VecStore:
         self._conn = open_connection(db_path)
         self._schema: Schema | None = None
 
-    def __enter__(self) -> "VecStore":
+    def __enter__(self) -> "VecDB":
         return self
 
     def __exit__(self, *exc_info) -> bool:

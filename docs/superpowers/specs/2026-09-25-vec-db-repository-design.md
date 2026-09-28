@@ -130,9 +130,9 @@ create virtual table <内部固定表名> using vec0(
 ## 4. 对外 API
 
 ```python
-from simple_rag.repository import VecStore, Schema, VecSearchResult
+from simple_rag.repository import VecDB, Schema, VecSearchResult
 
-with VecStore(db_path) as db:
+with VecDB(db_path) as db:
     # "loc" / "content" 是随手取的字段名 —— 模块不认识它们代表的任何含义
     db.create_table(Schema(
         dim=768,
@@ -425,7 +425,7 @@ conn.execute("pragma journal_mode=WAL")
 ```
 
 - **`enable_load_extension(False)` 必须紧跟 `load()`** —— 实测关掉后再 `load()` 报 `not authorized`
-- **连接由 `VecStore` 实例持有，不是模块级全局**。按需创建，可同时存在多个。
+- **连接由 `VecDB` 实例持有，不是模块级全局**。按需创建，可同时存在多个。
   **模块 import 时不建立任何连接**
 - **不加 `check_same_thread=False`**，保持 Python 默认的线程亲和性
 - 构造失败时先 `close()` 再抛 —— 用局部变量 + 判空，否则 `connect` 本身失败时 `close()` 会抛
@@ -455,7 +455,7 @@ def create_table(schema):
     # 无论哪条路径，都把本次传入的 schema 存进实例
 ```
 
-**为什么必须定义这个**：`VecStore(path)` 之后无条件调 `create_table` 是**最常规的用法**
+**为什么必须定义这个**：`VecDB(path)` 之后无条件调 `create_table` 是**最常规的用法**
 （每次开库都调）。不定语义，第二次打开同一个 `.db` 就会 `table already exists` 报错。
 用 `create table if not exists` 只能避免报错，**但会静默接受一个结构不同的库**。
 
@@ -517,15 +517,15 @@ vec0 不能 `ALTER`，所以改 dim / metric 只能重建。**模块不提供 dr
 
 ```
 simple_rag/repository/
-  __init__.py      对外出口：VecStore / Schema / VecSearchResult
-  vec_db.py        VecStore 类（持有连接 + Schema + 事务控制）
+  __init__.py      对外出口：VecDB / Schema / VecSearchResult
+  vec_db.py        VecDB 类（持有连接 + Schema + 事务控制）
   _connection.py   建连接（加载扩展）+ 关闭
   _schema.py       Schema 校验 + DDL 生成（纯函数）
   _codec.py        归一化 + dtype（纯函数）
   _store.py        SQL 文本构造（纯函数，返回 (sql, params)）
 ```
 
-**Schema 由 `VecStore` 实例持有**，`create_table` 时存入。未调 `create_table` 就调其他方法 → `ValueError`。
+**Schema 由 `VecDB` 实例持有**，`create_table` 时存入。未调 `create_table` 就调其他方法 → `ValueError`。
 
 **校验职责划分**（避免散落或重复）：
 

@@ -12,9 +12,9 @@
 ## 用法
 
 ```python
-from simple_rag.repository import VecStore, Schema
+from simple_rag.repository import VecDB, Schema
 
-with VecStore("vec.db") as db:
+with VecDB("vec.db") as db:
     # "loc" / "content" 是随手取的名字，模块不认识它们代表的任何含义
     db.create_table(Schema(
         dim=768,
@@ -80,8 +80,8 @@ Top-K **之前** —— 所以它拿不到「某个字段值下的全部结果�
 
 | 文件 | 职责 |
 |---|---|
-| `__init__.py` | 对外出口：`VecStore` / `Schema` / `VecSearchResult` |
-| `vec_db.py` | `VecStore` —— 持有连接、Schema、事务控制 |
+| `__init__.py` | 对外出口：`VecDB` / `Schema` / `VecSearchResult` |
+| `vec_db.py` | `VecDB` —— 持有连接、Schema、事务控制 |
 | `_schema.py` | Schema 校验 + DDL 生成（纯函数） |
 | `_store.py` | SQL 文本构造 + 记录 / `where` / `k` 的校验（纯函数） |
 | `_codec.py` | 向量归一化 + dtype 统一（纯函数） |

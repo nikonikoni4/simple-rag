@@ -4,12 +4,12 @@
 
 对外只有三个名字：
 
-- `VecStore` —— 开库、建表、增删改查
+- `VecDB` —— 开库、建表、增删改查
 - `Schema` —— 表的形状
 - `VecSearchResult` —— `search` / `get` 的返回
 """
 
 from ._schema import Schema
-from .vec_db import VecSearchResult, VecStore
+from .vec_db import VecSearchResult, VecDB
 
-__all__ = ["Schema", "VecSearchResult", "VecStore"]
+__all__ = ["Schema", "VecSearchResult", "VecDB"]

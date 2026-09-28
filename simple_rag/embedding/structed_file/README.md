@@ -97,7 +97,7 @@ Segment      一段：面包屑 + 纯正文 + 行区间 + 落在本段内的特�
     ↓ 装箱
 ChunkDraft   一个 chunk：若干 Segment（还没有向量）
     ↓ embedding
-Chunk        最终产物，带向量，可直接交给 VecStore
+Chunk        最终产物，带向量，可直接交给 VecDB
 ```
 
 **面包屑和摘要都不写进 `Segment.text`。** 存的时候分开存，用的时候才拼 ——

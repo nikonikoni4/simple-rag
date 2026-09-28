@@ -1,10 +1,10 @@
-"""`VecStore` 的端到端测试 —— 真开临时库，真跑 vec0。"""
+"""`VecDB` 的端到端测试 —— 真开临时库，真跑 vec0。"""
 
 import sqlite3
 
 import pytest
 
-from simple_rag.repository import Schema, VecSearchResult, VecStore
+from simple_rag.repository import Schema, VecSearchResult, VecDB
 from simple_rag.repository._schema import MAX_AUXILIARY, MAX_FILTERABLE, TABLE_NAME
 
 DIM = 8
@@ -47,7 +47,7 @@ def db_path(tmp_path):
 
 @pytest.fixture
 def store(db_path):
-    instance = VecStore(db_path)
+    instance = VecDB(db_path)
     yield instance
     instance.close()
 
@@ -114,12 +114,12 @@ def test_关闭后再操作抛_ProgrammingError(store):
 # ---------------------------------------------------------------- 重开与建表校验
 
 def test_重开同一个库不报_table_already_exists(db_path):
-    first = VecStore(db_path)
+    first = VecDB(db_path)
     first.create_table(SCHEMA)
     first.insert([record("c-1")])
     first.close()
 
-    second = VecStore(db_path)
+    second = VecDB(db_path)
     second.create_table(SCHEMA)  # 最常规的用法：每次开库都调
     assert second.get("c-1").fields["loc"] == "a.md"
     second.close()
@@ -133,11 +133,11 @@ def test_重开同一个库不报_table_already_exists(db_path):
     ],
 )
 def test_打开的不是这个_Schema_建的库(db_path, other):
-    first = VecStore(db_path)
+    first = VecDB(db_path)
     first.create_table(SCHEMA)
     first.close()
 
-    second = VecStore(db_path)
+    second = VecDB(db_path)
     with pytest.raises(ValueError, match="不是这个 Schema 建的库"):
         second.create_table(other)
     second.close()
@@ -149,7 +149,7 @@ def test_库里已有的表不是本模块建的(db_path):
     plain.commit()
     plain.close()
 
-    store = VecStore(db_path)
+    store = VecDB(db_path)
     with pytest.raises(ValueError, match="不是本模块建的"):
         store.create_table(SCHEMA)
     store.close()
@@ -542,7 +542,7 @@ def test_SQL_关键字字段名重开库照常(store, db_path):
                    "order": "乙", "select": "丙", "where": "丁"}])
     store.close()
 
-    again = VecStore(db_path)
+    again = VecDB(db_path)
     again.create_table(KEYWORD_SCHEMA)
     assert again.search(onehot(0), k=1, where={"from": "甲"})[0].fields["from"] == "甲"
     again.close()
@@ -596,8 +596,8 @@ def test_超过列数上限在_Schema_阶段就被拦(store):
 
 def test_可以同时开多个库(tmp_path):
     """连接由实例持有，不是模块级全局。"""
-    a = VecStore(tmp_path / "a.db")
-    b = VecStore(tmp_path / "b.db")
+    a = VecDB(tmp_path / "a.db")
+    b = VecDB(tmp_path / "b.db")
     try:
         a.create_table(SCHEMA)
         b.create_table(Schema(dim=4, metric="L2"))
@@ -611,7 +611,7 @@ def test_可以同时开多个库(tmp_path):
 
 def test_close_之后_db_文件可以删掉(db_path):
     """不关连接的话 Windows 上会 WinError 32（实测）。"""
-    store = VecStore(db_path)
+    store = VecDB(db_path)
     store.create_table(SCHEMA)
     store.insert([record("c-1")])
     store.close()
