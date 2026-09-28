@@ -9,6 +9,25 @@
 - 踩过的坑（全部实测）：[explore/sqlite-vec](../../explore/sqlite-vec/FINDINGS.md)
 - 设计规则：[CLAUDE.md](../../CLAUDE.md)
 
+## sqlite-vec 的列类型与本模块的对应
+
+底层 `vec0` 虚拟表有 **5 类列**，本模块只用了其中 **4 类**（不用 partition key）：
+
+| sqlite-vec 列类型 | 它的作用 | 本模块怎么用 |
+|---|---|---|
+| **向量列** | 存向量；KNN 靠它算距离 | 固定列 `embedding float[dim] distance_metric=…` |
+| **主键列** | 唯一标识；库强制唯一、自带索引 | 固定列 `chunk_id text primary key`（值由调用方给） |
+| **metadata 列**（普通列） | 能 SELECT，**能进 KNN 的 `where` 过滤** | `created_at` / `updated_at` + **`filterable` 里声明的字段** |
+| **辅助列**（加号列） | 能 SELECT，适合放长文本；**不能进 KNN 的 `where`** | **不在 `filterable` 里的字段**（DDL 里写作 `+字段名`） |
+| **partition key** | 分区加速，但查询形状受限（`IN`/`OR` 会崩、不能 UPDATE） | **不使用** |
+
+要点：
+
+- **`filterable` 的语义就一句话**：把字段存成 **metadata 列**（而不是辅助列）。存成 metadata 才有资格进 `search` 的 `where`。
+- **两类列的 16 个上限各自独立、互不叠加**；`created_at` / `updated_at` 占掉 2 个 metadata 名额，所以 `filterable` 最多 **14** 个、其余字段最多 **16** 个。
+- **`chunk_id` 主键不占** metadata 名额。
+- 列类型的完整实测差异见 [FINDINGS.md §4](../../explore/sqlite-vec/FINDINGS.md)。
+
 ## 用法
 
 ```python
@@ -28,7 +47,9 @@ with VecDB("vec.db") as db:
         {"chunk_id": "c-2", "vector": [...], "loc": "b.md", "content": "..."},
     ])
 
-    hits = db.search(query_vector, k=5, where={"loc": "a.md"})  # 向量相似度查询
+    # 向量相似度查询：where 的值可为 str（等值）或 (操作符, 值) 元组（范围）
+    hits = db.search(query_vector, k=5, where={"loc": "a.md"})
+    hits = db.search(query_vector, k=5, where={"loc": (">=", "2025-01-01")})  # 时间范围
     row = db.get("c-2")                                        # 普通查询，按 id 取一行
 
     db.update("c-1", vector=new_vector, fields={"content": "改过的正文"})
@@ -37,6 +58,14 @@ with VecDB("vec.db") as db:
 
 `create_table` 每次开库都调是**最常规的用法** —— 表已存在时会比对 `dim` / `metric`，
 不一致报 `ValueError`（不是 `if not exists` 那种静默接受）。
+
+## `search` 的 `where`
+
+- 键只能是 `chunk_id`，或 `filterable` 里声明的字段（其余字段存成加号列，**不能进 `where`**）
+- 值两种写法：**`str` = 等值**；**`(操作符, 值)` = 比较**，操作符为 `>` / `>=` / `<` / `<=`（`=` 亦可）
+- 多个键之间是 **AND**；`None` 或空 `dict` = 不过滤
+- ⚠️ **字段列都是 `TEXT`，比较是字符串序**：对 ISO 时间戳（等长，字典序 = 时间序）正确；
+  对纯数字**不正确**（`"9" >= "18"` 为真）。要按数字比，请补零成等长
 
 ## 两条查询路径
 

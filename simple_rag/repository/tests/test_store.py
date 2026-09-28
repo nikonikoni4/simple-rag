@@ -35,18 +35,49 @@ def test_k_类型不对(k):
 # ---------------------------------------------------------------- check_where
 
 def test_where_为_None_就是不筛():
-    assert _store.check_where(SCHEMA, None) == {}
+    assert _store.check_where(SCHEMA, None) == []
 
 
 def test_where_空_dict_就是不筛():
-    assert _store.check_where(SCHEMA, {}) == {}
+    assert _store.check_where(SCHEMA, {}) == []
 
 
 def test_where_允许_chunk_id_和可过滤字段():
-    assert _store.check_where(SCHEMA, {"loc": "a.md", "chunk_id": "c-1"}) == {
-        "loc": "a.md",
-        "chunk_id": "c-1",
-    }
+    assert _store.check_where(SCHEMA, {"loc": "a.md", "chunk_id": "c-1"}) == [
+        ("loc", "=", "a.md"),
+        ("chunk_id", "=", "c-1"),
+    ]
+
+
+def test_where_str_值归一化成等值():
+    assert _store.check_where(SCHEMA, {"loc": "a.md"}) == [("loc", "=", "a.md")]
+
+
+@pytest.mark.parametrize("op", ["=", ">", ">=", "<", "<="])
+def test_where_元组表达比较_五种操作符(op):
+    assert _store.check_where(SCHEMA, {"loc": (op, " 2025-06-01")}) == [
+        ("loc", op, " 2025-06-01")
+    ]
+
+
+def test_where_元组的操作符不支持就报错():
+    with pytest.raises(ValueError, match="操作符"):
+        _store.check_where(SCHEMA, {"loc": ("~=", "a")})
+
+
+def test_where_元组的比较值必须是_str():
+    with pytest.raises(TypeError, match="比较值必须是 str"):
+        _store.check_where(SCHEMA, {"loc": (">=", 5)})
+
+
+def test_where_元组长度不对报错():
+    with pytest.raises(TypeError, match="必须是 str"):
+        _store.check_where(SCHEMA, {"loc": (">=", "a", "b")})
+
+
+def test_where_列表不算元组():
+    with pytest.raises(TypeError, match="必须是 str"):
+        _store.check_where(SCHEMA, {"loc": [">=", "a"]})
 
 
 def test_where_不许过滤加号列():
@@ -61,7 +92,7 @@ def test_where_不许过滤未声明的字段():
 
 
 @pytest.mark.parametrize("value", [1, None, b"x", ["a"]])
-def test_where_的值必须是_str(value):
+def test_where_的值类型不对(value):
     with pytest.raises(TypeError, match="必须是 str"):
         _store.check_where(SCHEMA, {"loc": value})
 
@@ -143,18 +174,30 @@ def test_insert_标识符加方括号():
 
 
 def test_search_带_distance_且用_k_约束():
-    sql, keys = _store.build_search(SCHEMA, {})
+    sql, values = _store.build_search(SCHEMA, [])
     assert sql == (
         "select [chunk_id], [created_at], [updated_at], [loc], [content], [from], "
         "[distance] from chunks where [embedding] match ? and k = ?"
     )
-    assert keys == []
+    assert values == []
 
 
 def test_search_多键是_AND_并给出参数顺序():
-    sql, keys = _store.build_search(SCHEMA, {"loc": "a.md", "chunk_id": "c-1"})
+    conditions = _store.check_where(SCHEMA, {"loc": "a.md", "chunk_id": "c-1"})
+    sql, values = _store.build_search(SCHEMA, conditions)
     assert sql.endswith("where [embedding] match ? and [loc] = ? and [chunk_id] = ? and k = ?")
-    assert keys == ["loc", "chunk_id"]  # 参数顺序由它决定
+    assert values == ["a.md", "c-1"]  # 参数顺序由它决定
+
+
+def test_search_范围子句按操作符拼接():
+    conditions = _store.check_where(
+        SCHEMA, {"loc": (">=", "2025-06-01"), "chunk_id": ("<", "c-9")}
+    )
+    sql, values = _store.build_search(SCHEMA, conditions)
+    assert sql.endswith(
+        "where [embedding] match ? and [loc] >= ? and [chunk_id] < ? and k = ?"
+    )
+    assert values == ["2025-06-01", "c-9"]
 
 
 def test_get_不带_distance():
@@ -181,7 +224,7 @@ def test_所有_DML_都不用双引号():
     """双引号在找不到列名时会退化成字符串字面量（探针 19）。"""
     sqls = [
         _store.build_insert(SCHEMA),
-        _store.build_search(SCHEMA, {"loc": "x"})[0],
+        _store.build_search(SCHEMA, [("loc", "=", "x")])[0],
         _store.build_get(SCHEMA),
         _store.build_update(["updated_at"]),
         _store.build_delete(),

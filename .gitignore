@@ -5,3 +5,4 @@ explore
 __pycache__/
 *.py[cod]
 simple_rag.egg-info
+.claude

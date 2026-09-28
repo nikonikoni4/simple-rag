@@ -206,19 +206,21 @@ class VecDB:
     # ---------------------------------------------------------------- 读
 
     def search(self, vector, k: int, where=None) -> list[VecSearchResult]:
-        """向量相似度查询：最近的 `k` 条，可加等值过滤。
+        """向量相似度查询：最近的 `k` 条，可加过滤。
 
         - 用 `k = ?` 约束，不用 `order by distance limit`
         - 距离并列时的顺序**不是稳定契约**；返回条数可能少于 `k`
         - `where` 只能过滤 `chunk_id` 与显式声明为可过滤的字段
+        - `where` 的值可以是 `str`（等值）或 `(op, value)` 元组
+          （`op` = `>` / `>=` / `<` / `<=`，用于范围比较）；多项之间是 AND
         """
         schema = self._require_schema()
         k = _store.check_k(k)
         conditions = _store.check_where(schema, where)
         blob = vector_to_sqlite_vector(vector, schema.dim)
 
-        sql, keys = _store.build_search(schema, conditions)
-        params = [blob, *(conditions[key] for key in keys), k]
+        sql, where_values = _store.build_search(schema, conditions)
+        params = [blob, *where_values, k]
         rows = self._conn.execute(sql, params).fetchall()
         return [self._to_result(schema, row, from_search=True) for row in rows]
 

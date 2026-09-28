@@ -326,6 +326,34 @@ def test_search_的_where_多键是_AND(store):
     assert [h.chunk_id for h in hits] == ["c-1"]
 
 
+def test_search_的_where_支持范围比较(store):
+    store.create_table(SCHEMA)
+    store.insert([
+        record("c-1", loc="2025-01-01"),
+        record("c-2", loc="2025-06-01"),
+        record("c-3", loc="2025-12-01"),
+    ])
+    # 字段是 TEXT，比较是字符串序 —— ISO 日期恰好字典序 = 时间序
+    assert {h.chunk_id for h in store.search(onehot(0), k=10, where={"loc": (">=", "2025-06-01")})} == {"c-2", "c-3"}
+    assert {h.chunk_id for h in store.search(onehot(0), k=10, where={"loc": ("<", "2025-06-01")})} == {"c-1"}
+
+
+def test_search_的_where_范围与等值可组合(store):
+    store.create_table(SCHEMA)
+    store.insert([record("c-1", loc="2025-01-01"), record("c-2", loc="2025-06-01")])
+    hits = store.search(
+        onehot(0), k=10, where={"loc": (">=", "2025-01-01"), "chunk_id": "c-2"}
+    )
+    assert [h.chunk_id for h in hits] == ["c-2"]
+
+
+def test_search_的_where_未知操作符报错(store):
+    store.create_table(SCHEMA)
+    store.insert([record("c-1")])
+    with pytest.raises(ValueError, match="操作符"):
+        store.search(onehot(0), k=1, where={"loc": ("~=", "a")})
+
+
 def test_search_不能过滤加号列(store):
     store.create_table(SCHEMA)  # content 是加号列
     store.insert([record("c-1")])

@@ -16,6 +16,14 @@ from ._schema import TABLE_NAME, Schema
 # 实测边界（探针 18）：4097 -> `k value in knn query too large ... the limit is 4096`
 K_MIN, K_MAX = 0, 4096
 
+# KNN 的 where 支持的比较操作符。实测（探针 06 / 18）：metadata 列在 KNN 里支持
+# 等值 / 范围 / IN / OR —— 本模块只开放等值与范围比较（用途是时间范围）。
+# `=` 与直接给 str 等价。
+_COMPARISON_OPS = frozenset({"=", ">", ">=", "<", "<="})
+
+# `check_where` 归一化后的一条条件：(字段, 操作符, 值)
+Condition = tuple[str, str, str]
+
 
 def quote(name: str) -> str:
     return f"[{name}]"
@@ -38,16 +46,24 @@ def build_insert(schema: Schema) -> str:
     return f"insert into {TABLE_NAME} ({_identifiers(names)}) values ({placeholders})"
 
 
-def build_search(schema: Schema, where: Mapping[str, str]) -> tuple[str, list[str]]:
-    """返回 `(sql, where 的键顺序)` —— 参数顺序由第二个值决定。"""
-    keys = list(where)
+def build_search(
+    schema: Schema, conditions: Sequence[Condition]
+) -> tuple[str, list[str]]:
+    """返回 `(sql, where 的参数值列表)` —— 参数顺序由第二个值决定。
+
+    `conditions` 是 `check_where` 归一化后的 `(字段, 操作符, 值)` 序列；
+    操作符来自固定白名单，直接拼进 SQL 是安全的。
+    """
     clauses = [f"{quote('embedding')} match ?"]
-    clauses += [f"{quote(key)} = ?" for key in keys]
+    values: list[str] = []
+    for key, op, value in conditions:
+        clauses.append(f"{quote(key)} {op} ?")
+        values.append(value)
     sql = (
         f"select {_identifiers(_select_names(schema, with_distance=True))} "
         f"from {TABLE_NAME} where {' and '.join(clauses)} and k = ?"
     )
-    return sql, keys
+    return sql, values
 
 
 def build_get(schema: Schema) -> str:
@@ -84,30 +100,57 @@ def check_k(k) -> int:
     return k
 
 
-def check_where(schema: Schema, where) -> dict[str, str]:
-    """只支持**等值**过滤，且只在 `search` 里生效。
+def check_where(schema: Schema, where) -> list[Condition]:
+    """校验并归一化 `search` 的 `where`，返回 `(字段, 操作符, 值)` 列表（多项 AND）。
 
     key 必须是 `chunk_id` 或显式声明为可过滤的字段 —— 其余字段存成加号列，
     在 KNN 里过滤不了（实测探针 18）。
+
+    value 两种写法：
+
+    - `str`          —— 等值，等价于 `("=", value)`
+    - `(op, value)`  —— 比较，`op` 是 `=` / `>` / `>=` / `<` / `<=` 之一
+
+    ⚠️ 字段列都是 `TEXT`，比较是**字符串序**：对 ISO 时间戳（等长，字典序即时间序）
+    正确，对纯数字不正确（`"9" >= "18"` 为真）。
     """
     if where is None:
-        return {}
+        return []
     if not isinstance(where, Mapping):
         raise TypeError(f"where 必须是 mapping，收到 {type(where).__name__}")
     allowed = {"chunk_id", *schema.filterable}
-    checked: dict[str, str] = {}
+    conditions: list[Condition] = []
     for key, value in where.items():
         if key not in allowed:
             raise ValueError(
                 f"where 的键 {key!r} 不能用于过滤：只能是 'chunk_id'，"
                 f"或 Schema.filterable 里声明的字段 {list(schema.filterable)}"
             )
-        if not isinstance(value, str):
-            raise TypeError(
-                f"where 的值必须是 str，{key!r} 收到 {type(value).__name__}"
+        op, raw = _parse_condition(key, value)
+        conditions.append((key, op, raw))
+    return conditions
+
+
+def _parse_condition(key: str, value) -> tuple[str, str]:
+    """把一个 `where` 的值归一化成 `(操作符, 文本值)`。"""
+    if isinstance(value, str):
+        return "=", value
+    if isinstance(value, tuple) and len(value) == 2:
+        op, raw = value
+        if op not in _COMPARISON_OPS:
+            raise ValueError(
+                f"where 的键 {key!r} 的比较操作符 {op!r} 不支持："
+                f"只能是 {sorted(_COMPARISON_OPS)} 之一，或直接给 str 表示等值"
             )
-        checked[key] = value
-    return checked
+        if not isinstance(raw, str):
+            raise TypeError(
+                f"where 的键 {key!r} 的比较值必须是 str，收到 {type(raw).__name__}"
+            )
+        return op, raw
+    raise TypeError(
+        f"where 的值必须是 str（等值）或 (操作符, 值) 元组，"
+        f"键 {key!r} 收到 {type(value).__name__}"
+    )
 
 
 def check_record(schema: Schema, record) -> str:

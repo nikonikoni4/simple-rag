@@ -48,9 +48,14 @@ class Schema:
     都是调用方的决定。
     """
 
+    # 向量维度；建表时写进 DDL 的 float[dim]，之后改不了
     dim: int
+    # 距离度量；同样在建表时锁死（见 _validate 里不给默认值的理由）
     metric: Literal["L2", "cosine"]
+    # 字段名，顺序即建表时列的顺序；分成可过滤与不可过滤两类（见 build_ddl）
     fields: tuple[str, ...] = ()
+    # filterable 必须是 fields 的子集：这些列声明为可过滤，能进 KNN search （向量检索时的条件筛选列）的 where
+    # sqlite-vec中的普通列（metadata）
     filterable: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
