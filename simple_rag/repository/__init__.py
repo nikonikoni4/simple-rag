@@ -1,15 +1,14 @@
-"""`simple_rag.repository` —— 独立的向量存储模块。
+"""`simple_rag.repository` —— 存储层。两个**互不依赖**的子包：
 
-**不与任何业务概念耦合**：不知道数据是什么、有多少、字段该怎么设计。
+- `vec`  —— sqlite-vec 的 `vec0` 表，向量相似度检索
+- `bm25` —— SQLite FTS5 表，关键词检索
 
-对外只有三个名字：
+**本包不导出任何名字。** 请从子包导入::
 
-- `VecDB` —— 开库、建表、增删改查
-- `Schema` —— 表的形状
-- `VecSearchResult` —— `search` / `get` 的返回
+    from simple_rag.repository.vec import Schema, VecDB
+    from simple_rag.repository.bm25 import BM25Index
+
+不放转发 —— 同一个类有两条公开路径时，「该用哪个」和「改哪个」都会变得含糊。
 """
 
-from ._schema import Schema
-from .vec_db import VecSearchResult, VecDB
-
-__all__ = ["Schema", "VecSearchResult", "VecDB"]
+__all__: list[str] = []

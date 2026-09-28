@@ -1,128 +1,82 @@
-# simple_rag/repository —— 向量存储模块
+# simple_rag/repository —— 存储层
 
-基于 sqlite-vec 的 `vec0` 虚拟表。一个 `.db` 文件一张表。
+两个**互不依赖**的子包，各管一种索引：
 
-**它不认识任何业务概念** —— 不知道数据是什么、有多少、字段该怎么设计。
-叫什么字段、要不要过滤，都是调用方的决定。
+| 子包 | 索引 | 检索方式 | 说明 |
+|---|---|---|---|
+| [vec](vec/README.md) | sqlite-vec 的 `vec0` 虚拟表 | 向量相似度（KNN） | 存向量 + 任意 text 字段 |
+| [bm25](bm25/README.md) | SQLite FTS5 虚拟表 | 关键词（BM25 打分） | 存 token 串的倒排索引 |
 
-- 设计：[spec](../../docs/superpowers/specs/2026-09-25-vec-db-repository-design.md)
-- 踩过的坑（全部实测）：[explore/sqlite-vec](../../explore/sqlite-vec/FINDINGS.md)
-- 设计规则：[CLAUDE.md](../../CLAUDE.md)
-
-## sqlite-vec 的列类型与本模块的对应
-
-底层 `vec0` 虚拟表有 **5 类列**，本模块只用了其中 **4 类**（不用 partition key）：
-
-| sqlite-vec 列类型 | 它的作用 | 本模块怎么用 |
-|---|---|---|
-| **向量列** | 存向量；KNN 靠它算距离 | 固定列 `embedding float[dim] distance_metric=…` |
-| **主键列** | 唯一标识；库强制唯一、自带索引 | 固定列 `chunk_id text primary key`（值由调用方给） |
-| **metadata 列**（普通列） | 能 SELECT，**能进 KNN 的 `where` 过滤** | `created_at` / `updated_at` + **`filterable` 里声明的字段** |
-| **辅助列**（加号列） | 能 SELECT，适合放长文本；**不能进 KNN 的 `where`** | **不在 `filterable` 里的字段**（DDL 里写作 `+字段名`） |
-| **partition key** | 分区加速，但查询形状受限（`IN`/`OR` 会崩、不能 UPDATE） | **不使用** |
-
-要点：
-
-- **`filterable` 的语义就一句话**：把字段存成 **metadata 列**（而不是辅助列）。存成 metadata 才有资格进 `search` 的 `where`。
-- **两类列的 16 个上限各自独立、互不叠加**；`created_at` / `updated_at` 占掉 2 个 metadata 名额，所以 `filterable` 最多 **14** 个、其余字段最多 **16** 个。
-- **`chunk_id` 主键不占** metadata 名额。
-- 列类型的完整实测差异见 [FINDINGS.md §4](../../explore/sqlite-vec/FINDINGS.md)。
-
-## 用法
+**本包不导出任何名字**（`__all__ = []`）。请从子包导入：
 
 ```python
-from simple_rag.repository import VecDB, Schema
-
-with VecDB("vec.db") as db:
-    # "loc" / "content" 是随手取的名字，模块不认识它们代表的任何含义
-    db.create_table(Schema(
-        dim=768,
-        metric="cosine",        # 没有默认值 —— 建表时锁死，之后改不了
-        fields=("loc", "content"),
-        filterable=("loc",),    # 从 fields 里挑出哪些能进 search 的 where
-    ))
-
-    db.insert([
-        {"chunk_id": "c-1", "vector": [...], "loc": "a.md", "content": "..."},
-        {"chunk_id": "c-2", "vector": [...], "loc": "b.md", "content": "..."},
-    ])
-
-    # 向量相似度查询：where 的值可为 str（等值）或 (操作符, 值) 元组（范围）
-    hits = db.search(query_vector, k=5, where={"loc": "a.md"})
-    hits = db.search(query_vector, k=5, where={"loc": (">=", "2025-01-01")})  # 时间范围
-    row = db.get("c-2")                                        # 普通查询，按 id 取一行
-
-    db.update("c-1", vector=new_vector, fields={"content": "改过的正文"})
-    db.delete("c-1")
+from simple_rag.repository.vec import Schema, VecDB
+from simple_rag.repository.bm25 import BM25Index
 ```
 
-`create_table` 每次开库都调是**最常规的用法** —— 表已存在时会比对 `dim` / `metric`，
-不一致报 `ValueError`（不是 `if not exists` 那种静默接受）。
+不放转发 —— 同一个类有两条公开路径时，「该用哪个」和「改哪个」都会变得含糊。
 
-## `search` 的 `where`
+## 依赖方向
 
-- 键只能是 `chunk_id`，或 `filterable` 里声明的字段（其余字段存成加号列，**不能进 `where`**）
-- 值两种写法：**`str` = 等值**；**`(操作符, 值)` = 比较**，操作符为 `>` / `>=` / `<` / `<=`（`=` 亦可）
-- 多个键之间是 **AND**；`None` 或空 `dict` = 不过滤
-- ⚠️ **字段列都是 `TEXT`，比较是字符串序**：对 ISO 时间戳（等长，字典序 = 时间序）正确；
-  对纯数字**不正确**（`"9" >= "18"` 为真）。要按数字比，请补零成等长
+```
+retrieval  →  repository.{vec, bm25}  →  db
+                     ↑
+              tokenization（只被 bm25 用）
+```
 
-## 两条查询路径
+- **`vec` 与 `bm25` 互不 import。** 两边各有一份 `_schema.py` / `_store.py`，
+  表名常量（`chunks` / `chunks_fts`）也是各写各的 —— 合并成一处「表名常量表」
+  等于让两个包互相依赖，换来的只是省两行。
+- 两边都**不创建也不关闭连接**，只接收 `simple_rag.db.Database` 注入的连接。
+- 两边都**不认识业务概念** —— 字段叫什么、存什么、要不要过滤，都是调用方的决定。
 
-**这是本模块的核心，不能混。** 返回类型是同一个 `VecSearchResult`，`get` 的 `distance` 是 `None`。
+## 两个子包的性质差异（不是设计缺陷）
 
-| | `search` 向量相似度查询 | `get` 普通查询 |
+| | `vec`（vec0） | `bm25`（FTS5） |
 |---|---|---|
-| 要查询向量 | ✅ 必须 | ❌ 不需要 |
-| 要 `k` | ✅ 必须（`0 <= k <= 4096`）| ❌ 没有这个概念 |
-| 返回排序 | 按距离升序 | 不按距离 |
-| 返回条数 | 最多 `k` 条 | 取到几行是几行 |
-| 加号列 | 能取到、**不能在 `where` 里过滤** | 能取到、不过滤 |
+| 原地改一列 | ✅ 支持（探针已验证） | ❌ 只能删+插 |
+| 所以有 `update` 吗 | 有 | **没有** —— 藏起「删了再插」会让人误以为它是原子的 |
+| `chunk_id` 的容忍度 | 任意字符串 | 必须是 ≥15 位 hex（要转成 `rowid`） |
+| 定位一行 | `chunk_id` 主键（有索引） | 按 `rowid`；按 `chunk_id` 是**全表扫** |
+| 写开销 | 快 | 双写让写入慢约 68%（5 万条实测） |
+| 检索耗时 | 5 万条 63.4 ms（KNN） | 5 万条 63.4 ms（`order by bm25()`，**线性**） |
 
-两条路径**不能互相替代**：`search` 必须有查询向量、必须给 `k`，而且过滤发生在取
-Top-K **之前** —— 所以它拿不到「某个字段值下的全部结果」，除非把 `k` 开到足够大。
-反过来，按 id 精确取一行也只能用 `get`。
+## 两条索引怎么保持一致
 
-## 调用方要知道的约束
+两边的写入可以放进**同一个事务**（共用同一个连接时，SQLite 的跨表事务原生原子）。
 
-| | |
-|---|---|
-| **可过滤字段的值应当 ≤ 12 字符** ⚠️ | 超了**结果仍然正确，但慢约 20 倍**（实测硬边界，不是渐进劣化）。路径 / URL / UUID 这类天生超长的值不适合当 `filterable` |
-| **两类列各自 16 个上限** | 普通列 16（`created_at` / `updated_at` 占 2 个）→ `filterable` 最多 14；加号列最多 16 |
-| **字段名** | 字母开头，后跟字母 / 数字 / 下划线。`chunk_id` / `embedding` / `distance` / `k` / `created_at` / `updated_at` / `vector` 是保留名 |
-| **`chunk_id` 是主键** | 必须由调用方给，库强制唯一，所有操作按它寻址。**重复插入报 `ValueError`**（vec0 抛的是 `OperationalError`，模块翻译过） |
-| **`created_at` / `updated_at` 由模块维护** | 不用传，传了报错。`insert` 时两者同值，`update` 只刷新 `updated_at`。格式 ISO 8601 + UTC |
-| **向量无条件归一化** | 统一在数据库模块内进行，不由调用方负责。dtype 也统一转 `float32` |
-| **不返回向量** | `get` / `search` 都只有文本。已知代价：加字段要重建表时读不回旧向量，只能重跑 embedding |
-| **连接由实例持有** | 不是模块级全局，要几个开几个。一个实例不跨线程；两个实例写同一个库，第二个会等到超时后报 `database is locked` |
-| **没有跨记录的事务边界** | `insert` 整批一个事务；`delete` / `update` 是**单条单事务** |
+```python
+with Database("vec.db") as database:
+    conn = database.connection
+    conn.execute("savepoint import")
+    try:
+        vec.insert(records)
+        bm25.insert(records)
+        conn.execute("release import")
+    except BaseException:
+        conn.execute("rollback to import")
+        conn.execute("release import")
+        raise
+```
 
-## 异常契约
-
-| 类型 | 含义 |
-|---|---|
-| `ValueError` | 输入不合法（值不对、范围不对、字段名不合法、`chunk_id` 冲突）|
-| `TypeError` | 类型不对 |
-| `sqlite3.Error` | 库层面的问题 |
+⚠️ `rollback to` 之后必须再 `release`，否则事务一直挂着不提交**且不报错**。
+详见 [db/README.md](../db/README.md)。
 
 ## 文件
 
 | 文件 | 职责 |
 |---|---|
-| `__init__.py` | 对外出口：`VecDB` / `Schema` / `VecSearchResult` |
-| `vec_db.py` | `VecDB` —— 持有连接、Schema、事务控制 |
-| `_schema.py` | Schema 校验 + DDL 生成（纯函数） |
-| `_store.py` | SQL 文本构造 + 记录 / `where` / `k` 的校验（纯函数） |
-| `_codec.py` | 向量归一化 + dtype 统一（纯函数） |
-| `_connection.py` | 建连接（加载扩展） |
-| `tests/` | 纯单测 3 个 + 端到端 1 个。`python -m pytest simple_rag/repository/tests` |
+| `__init__.py` | `__all__ = []`，不导出任何名字 |
+| `vec/` | 向量存储。见 [vec/README.md](vec/README.md) |
+| `bm25/` | 关键词存储。见 [bm25/README.md](bm25/README.md) |
 
-内部约定两条，改代码时别踩：
+## 测试
 
-1. **DDL 里字段名裸写，DML 里每个标识符加方括号。** vec0 拒绝 DDL 里一切带引号的
-   标识符；而 DML 里**不能用双引号** —— SQLite 找不到列名时它会退化成字符串字面量，
-   拼错列名不报错而是静默返回常量（实测探针 19 / 21）。
-2. **`insert` 失败时 `except` 里必须 `rollback()`。** 实测语句失败**不会**自动中止事务，
-   误调 `commit()` 会让半批数据真的落库（探针 18 §8.5 / 21 §11.5）。
+```bash
+python -m pytest simple_rag/repository -q
+```
 
-完整限制清单（写开销、重索引、打包等）见 spec §12。
+两个子包的测试各自跟着模块走（`vec/tests/`、`bm25/tests/`）。
+
+⚠️ 两个 `tests/` 目录**都没有 `__init__.py`**，pytest 按 basename 导入 ——
+所以测试文件名不能重名，`bm25` 的那几个都带了 `bm25` 前缀。

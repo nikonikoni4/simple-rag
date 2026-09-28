@@ -13,6 +13,10 @@ dependencies = [
     "requests",
     "python-dotenv",
     "sqlite-vec",
+    # tokenization 的内置分词器。**硬依赖，不是 extra** ——
+    # tokenization/__init__.py 在 import 时加载它，做成 extra 会让默认安装下
+    # `import simple_rag.tokenization` 直接 ModuleNotFoundError
+    "jieba",
 ]
 
 [project.optional-dependencies]
@@ -21,7 +25,11 @@ dev = ["pytest"]
 # 只把 simple_rag 当作模块打包 —— 根目录的 docs/ 与 tests/ 不是包
 [tool.setuptools.packages.find]
 include = ["simple_rag*"]
-exclude = ["simple_rag.repository.tests*"]
+# `fnmatch` 的 `*` 跨点匹配，所以这一条同时覆盖 vec.tests / bm25.tests /
+# tokenization.tests / db.tests。当前这些目录都没有 __init__.py，
+# find_packages 本来就不会收它们 —— 这条是「哪天有人补了 __init__.py，
+# 测试也不会被装进 wheel」的防线。
+exclude = ["simple_rag.*.tests*"]
 
 [tool.pytest.ini_options]
 # 让 `pytest`（不带 -m）也能 import 到 simple_rag：

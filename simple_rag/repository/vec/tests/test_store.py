@@ -2,8 +2,8 @@
 
 import pytest
 
-from simple_rag.repository._schema import Schema
-from simple_rag.repository import _store
+from simple_rag.repository.vec import _store
+from simple_rag.repository.vec._schema import Schema
 
 SCHEMA = Schema(
     dim=8,

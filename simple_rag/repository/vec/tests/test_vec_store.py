@@ -4,8 +4,9 @@ import sqlite3
 
 import pytest
 
-from simple_rag.repository import Schema, VecSearchResult, VecDB
-from simple_rag.repository._schema import MAX_AUXILIARY, MAX_FILTERABLE, TABLE_NAME
+from simple_rag.db import Database
+from simple_rag.repository.vec import Schema, VecSearchResult, VecDB
+from simple_rag.repository.vec._schema import MAX_AUXILIARY, MAX_FILTERABLE, TABLE_NAME
 
 DIM = 8
 
@@ -46,10 +47,17 @@ def db_path(tmp_path):
 
 
 @pytest.fixture
-def store(db_path):
-    instance = VecDB(db_path)
-    yield instance
-    instance.close()
+def database(db_path):
+    """连接的所有者 —— 谁创建谁负责关闭。"""
+    db = Database(db_path)
+    yield db
+    db.close()
+
+
+@pytest.fixture
+def store(database):
+    """`VecDB` 只接收注入的连接，自己不建也不关。"""
+    return VecDB(database.connection)
 
 
 # ---------------------------------------------------------------- 基本流程
@@ -75,20 +83,33 @@ def test_增删改查走一遍(store):
     assert store.get("c-2") is None
 
 
-def test_with_语句(store):
-    with store as s:
-        s.create_table(SCHEMA)
-        s.insert([record("c-1")])
-    # 退出 with 之后连接已关
+def test_insert_在调用方的事务里是子事务(database):
+    """`insert` 用 `SAVEPOINT` 而不用 `BEGIN` 的唯一直接证据。
+
+    调用方要把本表和别的表（比如 FTS5）圈进同一个事务时，`BEGIN` 会报
+    `cannot start a transaction within a transaction`；`SAVEPOINT` 会成为子事务，
+    随外层一起提交或回滚。
+    """
+    conn = database.connection
+    store = VecDB(conn)
+    store.create_table(SCHEMA)
+
+    conn.execute("savepoint outer")
+    store.insert([record("c-1")])
+    conn.execute("rollback to outer")
+    conn.execute("release outer")
+
+    assert store.get("c-1") is None
+
+
+def test_退出_Database_的_with_后连接已关(db_path):
+    with Database(db_path) as database:
+        store = VecDB(database.connection)
+        store.create_table(SCHEMA)
+        store.insert([record("c-1")])
+    # 退出 with 之后连接已关，VecDB 不做额外检查 —— 交给 sqlite3 抛
     with pytest.raises(sqlite3.ProgrammingError):
         store.get("c-1")
-
-
-def test_重复_close_是_noop(store):
-    store.create_table(SCHEMA)
-    store.close()
-    store.close()
-    store.close()
 
 
 def test_没调_create_table_就操作报错(store):
@@ -104,9 +125,12 @@ def test_没调_create_table_就操作报错(store):
         store.delete("c-1")
 
 
-def test_关闭后再操作抛_ProgrammingError(store):
+def test_关闭连接后再操作抛_ProgrammingError(db_path):
+    """`VecDB` 不检查连接状态 —— 交给 sqlite3 自己抛。"""
+    database = Database(db_path)
+    store = VecDB(database.connection)
     store.create_table(SCHEMA)
-    store.close()
+    database.close()
     with pytest.raises(sqlite3.ProgrammingError):
         store.get("c-1")
 
@@ -114,14 +138,16 @@ def test_关闭后再操作抛_ProgrammingError(store):
 # ---------------------------------------------------------------- 重开与建表校验
 
 def test_重开同一个库不报_table_already_exists(db_path):
-    first = VecDB(db_path)
-    first.create_table(SCHEMA)
-    first.insert([record("c-1")])
+    first = Database(db_path)
+    store = VecDB(first.connection)
+    store.create_table(SCHEMA)
+    store.insert([record("c-1")])
     first.close()
 
-    second = VecDB(db_path)
-    second.create_table(SCHEMA)  # 最常规的用法：每次开库都调
-    assert second.get("c-1").fields["loc"] == "a.md"
+    second = Database(db_path)
+    reopened = VecDB(second.connection)
+    reopened.create_table(SCHEMA)  # 最常规的用法：每次开库都调
+    assert reopened.get("c-1").fields["loc"] == "a.md"
     second.close()
 
 
@@ -133,13 +159,13 @@ def test_重开同一个库不报_table_already_exists(db_path):
     ],
 )
 def test_打开的不是这个_Schema_建的库(db_path, other):
-    first = VecDB(db_path)
-    first.create_table(SCHEMA)
+    first = Database(db_path)
+    VecDB(first.connection).create_table(SCHEMA)
     first.close()
 
-    second = VecDB(db_path)
+    second = Database(db_path)
     with pytest.raises(ValueError, match="不是这个 Schema 建的库"):
-        second.create_table(other)
+        VecDB(second.connection).create_table(other)
     second.close()
 
 
@@ -149,10 +175,10 @@ def test_库里已有的表不是本模块建的(db_path):
     plain.commit()
     plain.close()
 
-    store = VecDB(db_path)
+    database = Database(db_path)
     with pytest.raises(ValueError, match="不是本模块建的"):
-        store.create_table(SCHEMA)
-    store.close()
+        VecDB(database.connection).create_table(SCHEMA)
+    database.close()
 
 
 def test_没建表时库里没有表(store):
@@ -564,16 +590,19 @@ def test_SQL_关键字字段名能正常增删改查(store):
     assert store.get("c-1") is None
 
 
-def test_SQL_关键字字段名重开库照常(store, db_path):
+def test_SQL_关键字字段名重开库照常(store, database, db_path):
     store.create_table(KEYWORD_SCHEMA)
     store.insert([{"chunk_id": "c-1", "vector": onehot(0), "from": "甲",
                    "order": "乙", "select": "丙", "where": "丁"}])
-    store.close()
+    database.close()
 
-    again = VecDB(db_path)
-    again.create_table(KEYWORD_SCHEMA)
-    assert again.search(onehot(0), k=1, where={"from": "甲"})[0].fields["from"] == "甲"
-    again.close()
+    again_db = Database(db_path)
+    try:
+        again = VecDB(again_db.connection)
+        again.create_table(KEYWORD_SCHEMA)
+        assert again.search(onehot(0), k=1, where={"from": "甲"})[0].fields["from"] == "甲"
+    finally:
+        again_db.close()
 
 
 # ---------------------------------------------------------------- 列数上限
@@ -623,9 +652,11 @@ def test_超过列数上限在_Schema_阶段就被拦(store):
 # ---------------------------------------------------------------- 独立性
 
 def test_可以同时开多个库(tmp_path):
-    """连接由实例持有，不是模块级全局。"""
-    a = VecDB(tmp_path / "a.db")
-    b = VecDB(tmp_path / "b.db")
+    """连接由调用方持有，不是模块级全局。"""
+    db_a = Database(tmp_path / "a.db")
+    db_b = Database(tmp_path / "b.db")
+    a = VecDB(db_a.connection)
+    b = VecDB(db_b.connection)
     try:
         a.create_table(SCHEMA)
         b.create_table(Schema(dim=4, metric="L2"))
@@ -633,15 +664,16 @@ def test_可以同时开多个库(tmp_path):
         assert a.get("c-1") is not None
         assert b.get("c-1") is None
     finally:
-        a.close()
-        b.close()
+        db_a.close()
+        db_b.close()
 
 
 def test_close_之后_db_文件可以删掉(db_path):
     """不关连接的话 Windows 上会 WinError 32（实测）。"""
-    store = VecDB(db_path)
+    database = Database(db_path)
+    store = VecDB(database.connection)
     store.create_table(SCHEMA)
     store.insert([record("c-1")])
-    store.close()
+    database.close()
     db_path.unlink()
     assert not db_path.exists()

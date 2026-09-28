@@ -1,4 +1,18 @@
-# simple_rag/repository 向量存储模块 —— 设计
+# simple_rag.repository.vec 向量存储模块 —— 设计
+
+> **2026-09-29 位置与连接归属变更**
+>
+> 本文原描述 `simple_rag/repository` 这个单体包。它已拆成两个**互不依赖**的子包：
+> `repository/vec`（本文）与 `repository/bm25`（FTS5 关键词检索）；
+> 连接生命周期独立到 [`simple_rag.db`](../../../simple_rag/db/README.md)。
+>
+> **设计决策本身没变**，只有两处调整：
+> 1. 路径从 `simple_rag/repository/` 变为 `simple_rag/repository/vec/`
+> 2. `VecDB` **不再自己建连接、也不再关闭它** —— 改为接收调用方注入的
+>    `sqlite3.Connection`（由 `simple_rag.db.Database` 创建并负责关闭）
+>
+> 另外 `insert` 的事务控制从 `BEGIN` 改为 `SAVEPOINT`，让调用方能把本表与 FTS5 表的
+> 写入圈进同一个事务。
 
 > 日期：2026-09-25
 > 状态：待评审
@@ -130,9 +144,11 @@ create virtual table <内部固定表名> using vec0(
 ## 4. 对外 API
 
 ```python
-from simple_rag.repository import VecDB, Schema, VecSearchResult
+from simple_rag.db import Database
+from simple_rag.repository.vec import Schema, VecDB, VecSearchResult
 
-with VecDB(db_path) as db:
+with Database(db_path) as database:
+    db = VecDB(database.connection)     # 连接是注入的，本类不建也不关
     # "loc" / "content" 是随手取的字段名 —— 模块不认识它们代表的任何含义
     db.create_table(Schema(
         dim=768,
@@ -527,13 +543,18 @@ vec0 不能 `ALTER`，所以改 dim / metric 只能重建。**模块不提供 dr
 ## 11. 文件布局与测试
 
 ```
-simple_rag/repository/
-  __init__.py      对外出口：VecDB / Schema / VecSearchResult
-  vec_db.py        VecDB 类（持有连接 + Schema + 事务控制）
-  _connection.py   建连接（加载扩展）+ 关闭
-  _schema.py       Schema 校验 + DDL 生成（纯函数）
-  _codec.py        归一化 + dtype（纯函数）
-  _store.py        SQL 文本构造（纯函数，返回 (sql, params)）
+simple_rag/db/                 连接生命周期（2026-09-29 独立出来）
+  database.py                  Database 类 + open_connection 工厂
+
+simple_rag/repository/vec/     本模块
+  __init__.py                  对外出口：VecDB / Schema / VecSearchResult
+  vec_db.py                    VecDB 类（注入的连接 + Schema + 事务控制）
+  _schema.py                   Schema 校验 + DDL 生成（纯函数）
+  _codec.py                    归一化 + dtype（纯函数）
+  _store.py                    SQL 文本构造（纯函数，返回 (sql, params)）
+  tests/                       纯单测 3 个 + 端到端 1 个
+
+simple_rag/repository/bm25/    关键词检索（FTS5）—— 另一个子包，与 vec 互不依赖
 ```
 
 **Schema 由 `VecDB` 实例持有**，`create_table` 时存入。未调 `create_table` 就调其他方法 → `ValueError`。

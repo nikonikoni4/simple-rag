@@ -1,6 +1,7 @@
 """`VecDB` —— 向量存储的唯一对外类。
 
-持有连接、Schema 与事务控制。**它不认识任何业务概念。**
+**不持有连接** —— 连接由调用方注入（`simple_rag.db.Database`），本类不创建、
+也不关闭它。持有 Schema 与事务控制。**它不认识任何业务概念。**
 
 两条查询路径不能互相替代（spec §2）：
 
@@ -14,11 +15,9 @@ import sqlite3
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 
 from . import _store
 from ._codec import vector_to_sqlite_vector
-from ._connection import open_connection
 from ._schema import TABLE_NAME, Schema, build_ddl, parse_ddl
 
 
@@ -42,32 +41,20 @@ def _now() -> str:
 
 
 class VecDB:
-    """一个 `.db` 文件一个实例。
+    """持有一个**注入的**连接。
+
+    **没有 `close()`** —— 连接归调用方（`simple_rag.db.Database`）管。留一个
+    什么都不做的 `close()` 更危险：调用方以为收尾了，实际连接还开着。
 
     **不加 `check_same_thread=False`** —— 保持 Python 默认的线程亲和性，
     一个实例不跨线程使用。
     """
 
-    def __init__(self, db_path: str | Path) -> None:
-        self._conn = open_connection(db_path)
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
         self._schema: Schema | None = None
 
-    def __enter__(self) -> "VecDB":
-        return self
-
-    def __exit__(self, *exc_info) -> bool:
-        self.close()
-        return False
-
-    # ---------------------------------------------------------------- 生命周期
-
-    def close(self) -> None:
-        """关闭连接。重复调用是 no-op。
-
-        关闭后再调用其他方法**不做额外检查** —— sqlite3 自己会抛
-        `ProgrammingError`（实测探针 21）。
-        """
-        self._conn.close()
+    # ---------------------------------------------------------------- 建表
 
     def create_table(self, schema: Schema) -> None:
         """建表；表已存在则比对 `dim` 与 `metric`。
@@ -107,10 +94,17 @@ class VecDB:
     # ---------------------------------------------------------------- 写
 
     def insert(self, records: Iterable[Mapping]) -> None:
-        """整批插入，**一个事务**：全部成功或全部失败。
+        """整批插入，**一个 `SAVEPOINT`**：全部成功或全部失败。
+
+        用 `SAVEPOINT` 而不是 `BEGIN` —— 调用方可能已经开着事务（比如要把本表
+        和 FTS5 表的写入圈进同一个事务），那时 `BEGIN` 会报
+        `cannot start a transaction within a transaction`。`SAVEPOINT` 在事务外
+        会自己开一个，在事务内会成为子事务，**两种用法都对**（均实测）。
 
         `chunk_id` 冲突无法提前查（批内重复只有库知道），失败发生在事务中途，
-        这时**显式 `rollback`** —— 实测语句失败不会自动中止事务，退化成半批写入。
+        这时**显式 `rollback to` + `release`** —— 实测语句失败不会自动中止事务，
+        退化成半批写入；而 `rollback to` 不会把 savepoint 出栈，不 `release` 的话
+        事务一直挂着不提交，**而且不报错**。
         """
         schema = self._require_schema()
 
@@ -133,11 +127,12 @@ class VecDB:
             return
 
         conn = self._conn
-        conn.execute("begin")
+        conn.execute("savepoint vec_insert")
         try:
             conn.executemany(_store.build_insert(schema), rows)
         except sqlite3.OperationalError as exc:
-            conn.rollback()
+            conn.execute("rollback to vec_insert")
+            conn.execute("release vec_insert")
             # 实测（探针 18 §8.4）：vec0 抛的是 OperationalError 而不是
             # IntegrityError，sqlite_errorcode 还是通用的 1，只能匹配文本。
             # 表上只有主键一个唯一约束，所以匹配到这里就是 chunk_id 冲突
@@ -145,9 +140,10 @@ class VecDB:
                 raise ValueError(f"chunk_id 重复：{exc}") from exc
             raise
         except BaseException:
-            conn.rollback()
+            conn.execute("rollback to vec_insert")
+            conn.execute("release vec_insert")
             raise
-        conn.execute("commit")
+        conn.execute("release vec_insert")
 
     def update(
         self,

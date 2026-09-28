@@ -2,7 +2,7 @@
 
 import pytest
 
-from simple_rag.repository._schema import (
+from simple_rag.repository.vec._schema import (
     MAX_AUXILIARY,
     MAX_FILTERABLE,
     TABLE_NAME,

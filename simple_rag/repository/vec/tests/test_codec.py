@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from simple_rag.repository._codec import vector_to_sqlite_vector
+from simple_rag.repository.vec._codec import vector_to_sqlite_vector
 
 DIM = 4
 
