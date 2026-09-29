@@ -16,4 +16,13 @@ class Retriever(Protocol):
     融合用的是排名，不是分值。
     """
 
-    def search(self, query: str, k: int) -> list[RetrievalHit]: ...
+    def search(self, query: str, k: int) -> list[RetrievalHit]:
+        """检索一路。
+
+        Args:
+            query: 查询原文。
+            k: 本路召回条数。
+
+        Returns:
+            命中列表，列表顺序即该路的相关顺序（score 越小越相关）。
+        """

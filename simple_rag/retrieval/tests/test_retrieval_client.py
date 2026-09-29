@@ -19,28 +19,29 @@ from _fakes import FakeBM25Index, FakeEmbedding, FakeVecDB, bm25_row, vec_row
 
 def test_空配置报错():
     with pytest.raises(ValueError, match="至少要启用一个"):
-        RetrievalClient(FakeVecDB(), [])
+        RetrievalClient(FakeVecDB(), [], coarse_top_k=10)
 
 
 def test_未知检索器名报错():
     with pytest.raises(ValueError, match="未知"):
-        RetrievalClient(FakeVecDB(), [RetrieverConfig(name="fts4")])
+        RetrievalClient(FakeVecDB(), [RetrieverConfig(name="fts4")], coarse_top_k=10)
 
 
 def test_配vec但没注入embedding_client报错():
     with pytest.raises(ValueError, match="embedding_client"):
-        RetrievalClient(FakeVecDB(), [RetrieverConfig(name="vec")])
+        RetrievalClient(FakeVecDB(), [RetrieverConfig(name="vec")], coarse_top_k=10)
 
 
 def test_配bm25但没注入bm25_index报错():
     with pytest.raises(ValueError, match="bm25_index"):
-        RetrievalClient(FakeVecDB(), [RetrieverConfig(name="bm25")])
+        RetrievalClient(FakeVecDB(), [RetrieverConfig(name="bm25")], coarse_top_k=10)
 
 
 def test_两路都配_依赖齐则构造成功():
     client = RetrievalClient(
         FakeVecDB(),
         [RetrieverConfig(name="vec"), RetrieverConfig(name="bm25")],
+        coarse_top_k=10,
         embedding_client=FakeEmbedding([1.0]),
         bm25_index=FakeBM25Index(),
     )
@@ -50,10 +51,11 @@ def test_两路都配_依赖齐则构造成功():
 # ---------------------------------------------------------------- search
 
 
-def make_two_way(vec_hits, bm25_hits, rows):
+def make_two_way(vec_hits, bm25_hits, rows, coarse_top_k=10):
     return RetrievalClient(
         FakeVecDB(vec_hits, rows),
         [RetrieverConfig(name="vec"), RetrieverConfig(name="bm25")],
+        coarse_top_k=coarse_top_k,
         embedding_client=FakeEmbedding([1.0]),
         bm25_index=FakeBM25Index(bm25_hits),
     )
@@ -127,6 +129,7 @@ def test_只配vec一路_不碰bm25():
             {"a": vec_row("a"), "b": vec_row("b")},
         ),
         [RetrieverConfig(name="vec")],
+        coarse_top_k=10,
         embedding_client=FakeEmbedding([1.0]),
         bm25_index=bm25,  # 注入了但没配 → 不该被调
     )
@@ -135,15 +138,34 @@ def test_只配vec一路_不碰bm25():
     assert bm25.calls == []
 
 
-def test_k透传到各路():
-    vec_db = FakeVecDB([vec_row("a")], {"a": vec_row("a")})
-    bm25 = FakeBM25Index([bm25_row("a")])
+def test_粗排条数透传到各路_k只管最终截断():
+    """粗排与精排的条数分开：各路拿 coarse_top_k，最终返回截到 k。"""
+    vec_db = FakeVecDB(
+        [vec_row("a", distance=0.1), vec_row("b", distance=0.5)],
+        {"a": vec_row("a"), "b": vec_row("b")},
+    )
+    bm25 = FakeBM25Index([bm25_row("a"), bm25_row("b")])
     client = RetrievalClient(
         vec_db,
         [RetrieverConfig(name="vec"), RetrieverConfig(name="bm25")],
+        coarse_top_k=6,
         embedding_client=FakeEmbedding([1.0]),
         bm25_index=bm25,
     )
-    client.search("q", k=6)
+    results = client.search("q", k=1)
     assert vec_db.calls[0][1] == 6
     assert bm25.calls == [("q", 6)]
+    assert [r.chunk_id for r in results] == ["a"]  # a 两路都第一，融合分最高
+
+
+def test_coarse_top_k小于k_返回条数受限于候选池():
+    """coarse_top_k 是融合池的上限：池子比 k 浅，最终凑不满 k 条。"""
+    client = make_two_way(
+        [vec_row("a", distance=0.1), vec_row("b", distance=0.5)],
+        [bm25_row("a")],
+        rows={"a": vec_row("a"), "b": vec_row("b")},
+        coarse_top_k=1,
+    )
+    results = client.search("q", k=5)
+    # 两路各只回第 1 名（都是 a）→ 池里只有 a，b 进不了池
+    assert [r.chunk_id for r in results] == ["a"]
