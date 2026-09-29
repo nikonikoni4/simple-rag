@@ -10,19 +10,20 @@
 ```python
 from simple_rag.db import Database
 from simple_rag.repository.vec import VecDB, Schema
-from simple_rag.repository.bm25 import BM25Index
+from simple_rag.repository.bm25 import create_bm25
 from simple_rag.tokenization import TokenizerFactory
 
 with Database("vec.db") as database:
     conn = database.connection           # 同一个连接，注入给两边
     vec = VecDB(conn)
-    bm25 = BM25Index(conn, TokenizerFactory.create("jieba"))
+    bm25 = create_bm25("fts5", tokenizer=TokenizerFactory.create("jieba"), conn=conn)
 ```
 
 ## 谁负责关闭
 
-**谁创建谁负责。** `VecDB` / `BM25Index` 只接收注入的连接，**没有 `close()`** ——
-留一个什么都不做的 `close()` 更危险：调用方以为收尾了，实际连接还开着。
+**谁创建谁负责。** `VecDB` / bm25 实现（仅 fts5 用连接）只接收注入的连接，
+**没有 `close()`** —— 留一个什么都不做的 `close()` 更危险：调用方以为收尾了，
+实际连接还开着。
 
 `Database.close()` 重复调用是 no-op（`sqlite3.Connection.close()` 本身幂等，实测探针 21）。
 

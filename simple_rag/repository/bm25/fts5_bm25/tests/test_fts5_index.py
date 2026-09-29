@@ -1,4 +1,4 @@
-"""`BM25Index` 的端到端测试 —— 真开临时库，真跑 FTS5。"""
+"""`FTS5BM25Index` 的端到端测试 —— 真开临时库，真跑 FTS5。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,8 @@ import hashlib
 import pytest
 
 from simple_rag.db import Database
-from simple_rag.repository.bm25 import BM25Index, BM25SearchResult
+from simple_rag.repository.bm25 import BM25SearchResult
+from simple_rag.repository.bm25.fts5_bm25 import FTS5BM25Index
 from simple_rag.repository.vec import Schema, VecDB
 from simple_rag.tokenization import TokenizerFactory
 
@@ -38,8 +39,8 @@ def database(tmp_path):
 
 @pytest.fixture
 def index(database, tok):
-    instance = BM25Index(database.connection, tok)
-    instance.create_table()
+    instance = FTS5BM25Index(database.connection, tok)
+    instance.open()
     return instance
 
 
@@ -111,29 +112,133 @@ def test_空查询直接返回空且不发_SQL(index, blank):
     assert not any("match" in sql.lower() for sql in seen)
 
 
-# ---------------------------------------------------------------- 建表
+# ---------------------------------------------------------------- 打开
 
 
-def test_create_table_幂等(index):
+def test_open_幂等(index):
     """每次开库都调是最常规的用法 —— 不能报 `table already exists`。"""
-    index.create_table()
-    index.create_table()
+    index.open()
+    index.open()
 
 
-def test_create_table_撞普通表报错(database, tok):
+def test_open_撞普通表报错(database, tok):
     database.connection.execute("create table chunks_fts (a text, b text)")
     with pytest.raises(ValueError, match="不是 FTS5"):
-        BM25Index(database.connection, tok).create_table()
+        FTS5BM25Index(database.connection, tok).open()
 
 
-def test_create_table_撞别的_tokenizer_报错(database, tok):
+def test_open_撞别的_tokenizer_报错(database, tok):
     """tokenizer 不同 = token 不同 = **静默零召回** —— 必须拦。"""
     database.connection.execute(
         "create virtual table chunks_fts using fts5("
         "tokens, chunk_id unindexed, tokenize='trigram')"
     )
     with pytest.raises(ValueError, match="tokenizer"):
-        BM25Index(database.connection, tok).create_table()
+        FTS5BM25Index(database.connection, tok).open()
+
+
+# ---------------------------------------------------------------- 全量重建
+
+
+def test_rebuild_旧数据全没了(index):
+    index.insert([
+        {"chunk_id": cid(1), "text": DOC},
+        {"chunk_id": cid(2), "text": OTHER},
+    ])
+    assert index.rebuild([{"chunk_id": cid(3), "text": "全新的语料"}]) == 1
+    assert index.search("检索", k=5) == []
+    assert index.search("语料", k=5)[0].chunk_id == cid(3)
+
+
+def test_rebuild_空批把表清空(index):
+    """「重建为空」和「重建为这批」语义一致 —— 空批不是 no-op。"""
+    index.insert([{"chunk_id": cid(1), "text": DOC}])
+    assert index.rebuild([]) == 0
+    assert index.search("检索", k=5) == []
+
+
+def test_rebuild_是FTS5表且幂等可再写(index, database, tok):
+    """rebuild 删的是本模块的 FTS5 表，重建后普通流程（open/insert）照常。"""
+    index.rebuild([{"chunk_id": cid(1), "text": DOC}])
+    index.open()  # 不报错 = 重建出来的表 DDL 仍一致
+    assert index.insert([{"chunk_id": cid(2), "text": OTHER}]) == 1
+    assert index.search("词频", k=5)[0].chunk_id == cid(2)
+
+
+def test_rebuild_坏数据回滚_旧数据保留(index):
+    index.insert([{"chunk_id": cid(1), "text": DOC}])
+    with pytest.raises(ValueError, match="hex"):
+        index.rebuild([
+            {"chunk_id": cid(2), "text": OTHER},
+            {"chunk_id": "c-2", "text": OTHER},
+        ])
+    # 校验在写库前抛，旧数据原样
+    assert index.search("检索", k=5)[0].chunk_id == cid(1)
+
+
+def test_rebuild_savepoint内部失败回滚_旧数据保留(index):
+    """a / b 撞 rowid 对 —— 校验拦不住（chunk_id 不重复），失败发生在
+    savepoint 内部的 executemany，走的是 rollback 分支而不是写库前校验。"""
+    index.insert([{"chunk_id": cid(1), "text": DOC}])
+    a = "0123456789abcde" + "0" * 17
+    b = "0123456789abcde" + "1" * 17
+    with pytest.raises(ValueError, match="rowid 冲突"):
+        index.rebuild([
+            {"chunk_id": cid(2), "text": OTHER},
+            {"chunk_id": a, "text": OTHER},
+            {"chunk_id": b, "text": OTHER},  # 和 a 撞 rowid
+        ])
+    # 回滚到 savepoint —— 旧数据原样，连表都没被删
+    assert index.search("检索", k=5)[0].chunk_id == cid(1)
+
+
+# ---------------------------------------------------------------- 覆盖或插入
+
+
+def test_replace_覆盖已有(index):
+    index.insert([{"chunk_id": cid(1), "text": DOC}])
+    assert index.replace([{"chunk_id": cid(1), "text": OTHER}]) == 1
+    assert index.search("语义", k=5) == []
+    assert index.search("词频", k=5)[0].chunk_id == cid(1)
+
+
+def test_replace_不存在也直接写入(index):
+    assert index.replace([{"chunk_id": cid(1), "text": DOC}]) == 1
+    assert index.search("检索", k=5)[0].chunk_id == cid(1)
+
+
+def test_replace_同一批里新旧混合(index):
+    index.insert([{"chunk_id": cid(1), "text": DOC}])
+    assert index.replace([
+        {"chunk_id": cid(1), "text": OTHER},          # 覆盖
+        {"chunk_id": cid(2), "text": "第二条 语料"},   # 新插
+    ]) == 2
+    assert index.search("词频", k=5)[0].chunk_id == cid(1)
+    assert index.search("语料", k=5)[0].chunk_id == cid(2)
+
+
+def test_replace_失败整批回滚(index):
+    """删+插被一个 savepoint 圈住 —— 插入失败时被删的旧行必须回来。
+
+    a / b 是「不同 chunk_id、前 15 位 hex 相同」的 rowid 撞车对 —— 校验拦不住
+    （批内 chunk_id 不重复），失败发生在 savepoint 内部的 executemany。
+    撞 rowid 抛的 `IntegrityError` 被翻译成 `ValueError`，和 insert 一致。
+    """
+    index.insert([{"chunk_id": cid(1), "text": DOC}])
+    a = "0123456789abcde" + "0" * 17
+    b = "0123456789abcde" + "1" * 17
+    with pytest.raises(ValueError, match="rowid 冲突"):
+        index.replace([
+            {"chunk_id": cid(1), "text": OTHER},
+            {"chunk_id": a, "text": OTHER},
+            {"chunk_id": b, "text": OTHER},  # 和 a 撞 rowid，插到这里炸
+        ])
+    # cid(1) 的旧行必须原样 —— 删了没回滚就是数据丢失
+    assert index.search("语义", k=5)[0].chunk_id == cid(1)
+
+
+def test_replace_空批返回0(index):
+    assert index.replace([]) == 0
 
 
 # ---------------------------------------------------------------- 删除
@@ -238,8 +343,8 @@ def test_tokenizer_是注入的(database):
         def tokenize(self, text: str) -> list[str]:
             return [c for c in text if not c.isspace()]
 
-    index = BM25Index(database.connection, CharTokenizer())
-    index.create_table()
+    index = FTS5BM25Index(database.connection, CharTokenizer())
+    index.open()
     index.insert([{"chunk_id": cid(1), "text": "甲乙丙"}])
     # 单字一定能查到 —— jieba 会把「甲乙丙」当一个词，char 版本必然切单字
     assert index.search("乙", k=5)[0].chunk_id == cid(1)
@@ -247,7 +352,7 @@ def test_tokenizer_是注入的(database):
 
 def test_没有_close_和_update(database, tok):
     """连接归调用方；FTS5 不支持原地改列 —— 假方法会让人以为收尾/原子了。"""
-    index = BM25Index(database.connection, tok)
+    index = FTS5BM25Index(database.connection, tok)
     assert not hasattr(index, "close")
     assert not hasattr(index, "update")
 
@@ -258,9 +363,9 @@ def test_没有_close_和_update(database, tok):
 def _both(database, tok):
     conn = database.connection
     vec = VecDB(conn)
-    bm25 = BM25Index(conn, tok)
+    bm25 = FTS5BM25Index(conn, tok)
     vec.create_table(Schema(dim=4, metric="cosine", fields=("text",)))
-    bm25.create_table()
+    bm25.open()
     return vec, bm25
 
 
@@ -310,15 +415,15 @@ def test_跨表提交后两边都在(database, tok):
 
 
 def test_重开库数据还在(database, tok, tmp_path):
-    index = BM25Index(database.connection, tok)
-    index.create_table()
+    index = FTS5BM25Index(database.connection, tok)
+    index.open()
     index.insert([{"chunk_id": cid(1), "text": DOC}])
     database.close()
 
     again_db = Database(tmp_path / "bm25.db")
     try:
-        again = BM25Index(again_db.connection, tok)
-        again.create_table()
+        again = FTS5BM25Index(again_db.connection, tok)
+        again.open()
         assert again.search("检索", k=5)[0].chunk_id == cid(1)
     finally:
         again_db.close()

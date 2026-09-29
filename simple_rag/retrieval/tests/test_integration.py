@@ -12,7 +12,7 @@ import hashlib
 import pytest
 
 from simple_rag.db import Database
-from simple_rag.repository.bm25 import BM25Index
+from simple_rag.repository.bm25 import create_bm25
 from simple_rag.repository.vec import Schema, VecDB
 from simple_rag.retrieval.retrieval import RetrievalClient
 from simple_rag.retrieval.types import RetrieverConfig
@@ -30,7 +30,7 @@ TEXTS = [
 
 
 def cid_of(text: str) -> str:
-    """32 位 hex —— BM25Index 要求 chunk_id 是 15 位以上 hex。
+    """32 位 hex —— fts5 实现要求 chunk_id 是 15 位以上 hex。
 
     不能用 "c1" 这种短 id：写库前就抛。
     """
@@ -53,8 +53,12 @@ def client(database):
         for text, vec in TEXTS
     )
 
-    bm25_index = BM25Index(database.connection, TokenizerFactory.create("jieba"))
-    bm25_index.create_table()
+    bm25_index = create_bm25(
+        "fts5",
+        tokenizer=TokenizerFactory.create("jieba"),
+        conn=database.connection,
+    )
+    bm25_index.open()
     bm25_index.insert(
         {"chunk_id": cid_of(text), "text": text} for text, _ in TEXTS
     )
@@ -62,6 +66,7 @@ def client(database):
     return RetrievalClient(
         vec_db,
         [RetrieverConfig(name="vec"), RetrieverConfig(name="bm25")],
+        coarse_top_k=10,
         # 查询向量 = 第一条的向量 → vec 路第一名必然是它
         embedding_client=FakeEmbedding([1.0, 0.0, 0.0, 0.0]),
         bm25_index=bm25_index,

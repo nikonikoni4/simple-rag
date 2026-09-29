@@ -1,24 +1,25 @@
-"""`_store` 的纯单测 —— 只构造 SQL 文本，不碰数据库。"""
+"""FTS5 专属 `_store` 的纯单测 —— 只构造 SQL 文本，不碰数据库。
+
+通用的 `check_k` / `check_record` / `prepare_rows` 已上移 `..base.validation`，
+它们的测试在 `../../tests/test_validation.py`。
+"""
 
 from __future__ import annotations
 
 import pytest
 
-from simple_rag.repository.bm25._store import (
+from simple_rag.repository.bm25.fts5_bm25._store import (
     ROWID_HEX_CHARS,
+    build_ddl_drop,
     build_delete_by_rowids,
     build_insert,
     build_match_query,
     build_search,
-    check_k,
-    check_record,
-    prepare_rows,
     rowid_from_chunk_id,
 )
 
 # 32 位 hex —— 和本项目 Chunk.chunk_id 的形状一致
 CID = "0123456789abcdef0123456789abcdef"
-OTHER = "fedcba9876543210fedcba9876543210"
 
 
 # ---------------------------------------------------------------- rowid
@@ -80,60 +81,6 @@ def test_match_特殊字符被引号包住():
     assert build_match_query(["a-b", "c:d", "e*"]) == '"a-b" OR "c:d" OR "e*"'
 
 
-# ---------------------------------------------------------------- k
-
-
-def test_check_k_边界通过():
-    assert check_k(0) == 0
-    assert check_k(4096) == 4096
-
-
-@pytest.mark.parametrize("bad", [4097, -1, True, "1", 1.0, None])
-def test_check_k_非法报错(bad):
-    with pytest.raises((TypeError, ValueError)):
-        check_k(bad)
-
-
-# ---------------------------------------------------------------- 记录
-
-
-def test_check_record_返回元组():
-    assert check_record({"chunk_id": CID, "text": "正文"}) == (CID, "正文")
-
-
-@pytest.mark.parametrize(
-    "bad, exc",
-    [
-        ({"chunk_id": CID}, ValueError),
-        ({"text": "正文"}, ValueError),
-        ({"chunk_id": CID, "text": "正文", "extra": 1}, ValueError),
-        ({"chunk_id": 123, "text": "正文"}, TypeError),
-        ({"chunk_id": CID, "text": 123}, TypeError),
-        ("不是 mapping", TypeError),
-    ],
-)
-def test_check_record_非法报错(bad, exc):
-    with pytest.raises(exc):
-        check_record(bad)
-
-
-def test_prepare_rows_正常():
-    rows = prepare_rows(
-        [{"chunk_id": CID, "text": "a"}, {"chunk_id": OTHER, "text": "b"}]
-    )
-    assert rows == [(CID, "a"), (OTHER, "b")]
-
-
-def test_prepare_rows_批内重复报错():
-    """rowid 由 chunk_id 派生，批内重复必然撞 FTS5 主键 —— 提前拦。"""
-    with pytest.raises(ValueError, match="批内 chunk_id 重复"):
-        prepare_rows([{"chunk_id": CID, "text": "a"}, {"chunk_id": CID, "text": "b"}])
-
-
-def test_prepare_rows_空输入():
-    assert prepare_rows([]) == []
-
-
 # ---------------------------------------------------------------- SQL 文本
 
 
@@ -142,6 +89,12 @@ def test_build_insert_显式给_rowid():
     sql = build_insert()
     assert "rowid" in sql
     assert sql.count("?") == 3
+
+
+def test_build_drop_带_if_exists():
+    """rebuild 在表不在时也要能走 —— 删表必须是 if exists。"""
+    sql = build_ddl_drop()
+    assert "drop table if exists" in sql.lower()
 
 
 def test_build_delete_占位符数量():

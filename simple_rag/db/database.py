@@ -50,7 +50,7 @@ class Database:
         with Database("vec.db") as database:
             conn = database.connection
             vec = VecDB(conn)
-            bm25 = BM25Index(conn, tokenizer)
+            bm25 = create_bm25("fts5", tokenizer=tokenizer, conn=conn)
 
     两个存储共用**同一个连接**时，它们能放进同一个事务 —— 实测 `begin` / `rollback`
     对两张表同时生效（见 [TECHNICAL.md §6.2](../../explore/bm25/TECHNICAL.md)）。

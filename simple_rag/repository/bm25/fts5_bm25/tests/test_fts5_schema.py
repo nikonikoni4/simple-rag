@@ -6,7 +6,7 @@ import sqlite3
 
 import pytest
 
-from simple_rag.repository.bm25._schema import (
+from simple_rag.repository.bm25.fts5_bm25._schema import (
     CHUNK_ID_COLUMN,
     FTS_TABLE_NAME,
     FTS_TOKENIZER,

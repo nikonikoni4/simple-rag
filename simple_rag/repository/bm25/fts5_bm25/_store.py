@@ -1,4 +1,6 @@
-"""SQL 文本构造 + 记录 / `k` 的校验（纯函数，不碰连接）。
+"""FTS5 专属的 SQL 文本构造 + `rowid` 派生（纯函数，不碰连接）。
+
+通用的记录 / `k` 校验在 `..base.validation`；这里只剩 FTS5 独有的东西。
 
 **为什么 `vec` 和 `bm25` 各有一份，而不是共用一个通用层**：两边的 SQL 形状差太远
 —— vec0 是 `[embedding] match ? ... and k = ?`，FTS5 是 `match ? order by bm25()
@@ -9,12 +11,9 @@ limit ?`；参数和返回结构也不一样。硬抽一层只会得到到处 `i
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Sequence
 
 from ._schema import CHUNK_ID_COLUMN, FTS_TABLE_NAME, TOKENS_COLUMN
-
-# 实测边界（探针 18）：4097 -> `k value in knn query too large ... the limit is 4096`
-K_MIN, K_MAX = 0, 4096
 
 # 取 `chunk_id` 的前 15 个 hex 字符当 FTS5 的 rowid（60 bit）。
 # 实测 5 万条无碰撞。用 `chunk_id` 直接定位是**全表扫**（最坏 17.7 ms），
@@ -31,7 +30,7 @@ def rowid_from_chunk_id(chunk_id: str) -> int:
     （8 位 hex 时只有 32 bit 空间，5 万条约 29% 概率撞），所以这里显式拦。
 
     本项目的 `Chunk.chunk_id` 是 `blake2b(digest_size=16).hexdigest()`（32 位），
-    天然满足。
+    天然满足。rank_bm25 实现没有这个要求 —— 差异见包 README。
 
     ⚠️ 60 bit 是**截断**：两个 `chunk_id` 若前 15 位相同，后写入的会**覆盖**先写入的
     （rowid 是 FTS5 的主键）。5 万条实测无碰撞，但这是概率不是保证。
@@ -44,6 +43,15 @@ def rowid_from_chunk_id(chunk_id: str) -> int:
             f"本项目的 Chunk.chunk_id 是 blake2b(digest_size=16).hexdigest()"
         )
     return int(chunk_id[:ROWID_HEX_CHARS], 16)
+
+
+def build_ddl_drop() -> str:
+    """`rebuild` 用的删表语句。
+
+    `if exists` 在这里是对的 —— `rebuild` 的语义就是「不管表在不在，重建后只有
+    这批数据」，表不在也算一种「旧状态」，照常往下走。
+    """
+    return f"drop table if exists {FTS_TABLE_NAME}"
 
 
 def build_insert() -> str:
@@ -91,55 +99,3 @@ def build_match_query(tokens: Sequence[str]) -> str:
     token 内部的 `"` 写成 `""` 转义。
     """
     return " OR ".join('"' + t.replace('"', '""') + '"' for t in tokens)
-
-
-def check_k(k) -> int:
-    if isinstance(k, bool) or not isinstance(k, int):
-        raise TypeError(f"k 必须是 int，收到 {type(k).__name__}")
-    if not K_MIN <= k <= K_MAX:
-        raise ValueError(f"k 必须在 {K_MIN}~{K_MAX} 之间，收到 {k}")
-    return k
-
-
-def check_record(record) -> tuple[str, str]:
-    """校验一条记录的形状，返回 `(chunk_id, text)`。"""
-    if not isinstance(record, Mapping):
-        raise TypeError(f"每条记录必须是 mapping，收到 {type(record).__name__}")
-
-    expected = {"chunk_id", "text"}
-    keys = set(record)
-    unknown = keys - expected
-    if unknown:
-        raise ValueError(
-            f"记录里有不认识的键 {sorted(unknown)}，本模块只接受 {sorted(expected)}"
-        )
-    for name in sorted(expected):
-        if name not in keys:
-            raise ValueError(f"记录缺必需的键 {name!r}")
-
-    chunk_id, text = record["chunk_id"], record["text"]
-    if not isinstance(chunk_id, str):
-        raise TypeError(f"chunk_id 必须是 str，收到 {type(chunk_id).__name__}")
-    if not isinstance(text, str):
-        raise TypeError(f"text 必须是 str，收到 {type(text).__name__}")
-    return chunk_id, text
-
-
-def prepare_rows(records: Iterable[Mapping]) -> list[tuple[str, str]]:
-    """批量校验，返回 `[(chunk_id, text), ...]`。
-
-    **批内 `chunk_id` 重复在这里就拦掉。** rowid 由 `chunk_id` 派生，批内重复必然
-    撞 FTS5 的 rowid 主键；提前抛比让库抛清楚得多（而且能指出是哪两条）。
-    """
-    rows: list[tuple[str, str]] = []
-    seen: dict[str, int] = {}
-    for index, record in enumerate(records):
-        chunk_id, text = check_record(record)
-        if chunk_id in seen:
-            raise ValueError(
-                f"批内 chunk_id 重复：{chunk_id!r} 出现在第 {seen[chunk_id]} 条"
-                f"和第 {index} 条"
-            )
-        seen[chunk_id] = index
-        rows.append((chunk_id, text))
-    return rows

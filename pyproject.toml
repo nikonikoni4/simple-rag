@@ -17,6 +17,9 @@ dependencies = [
     # tokenization/__init__.py 在 import 时加载它，做成 extra 会让默认安装下
     # `import simple_rag.tokenization` 直接 ModuleNotFoundError
     "jieba",
+    # bm25 的 rank_bm25 实现。与 jieba 同理是硬依赖 ——
+    # `create_bm25("rank_bm25", ...)` 要在 import 期就拿到 BM25Okapi
+    "rank_bm25",
 ]
 
 [project.optional-dependencies]
