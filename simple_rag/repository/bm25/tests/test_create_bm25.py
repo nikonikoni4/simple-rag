@@ -7,7 +7,7 @@ import pytest
 from simple_rag.db import Database
 from simple_rag.repository.bm25 import BM25Index, create_bm25
 from simple_rag.repository.bm25.fts5_bm25 import FTS5BM25Index
-from simple_rag.repository.bm25.rank_bm25 import RankBM25Index
+from simple_rag.repository.bm25.okapi_bm25 import RankBM25Index
 from simple_rag.tokenization import TokenizerFactory
 
 

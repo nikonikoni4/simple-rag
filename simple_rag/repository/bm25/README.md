@@ -81,7 +81,7 @@ hits = bm25.search("检索", k=10)      # 分数同样是「越小越相关」
 | `open()` | 首建表或校验 DDL | 有 `persist_path` 且文件在则加载，否则空索引 |
 | `insert` / `delete` / `replace` | 支持（各自一个事务内） | **抛 `NotImplementedError`** |
 | `rebuild` | 删表 + 重建 + 全量插入 | 重算 `BM25Okapi`，自动写盘（配了 `persist_path`） |
-| 持久化 | 注入的 SQLite db 文件 | pickle 文件（纯数据，见 `rank_bm25/persistence.py`）或纯内存 |
+| 持久化 | 注入的 SQLite db 文件 | pickle 文件（纯数据，见 `okapi_bm25/persistence.py`）或纯内存 |
 | `k1` / `b` | 不可调（FTS5 硬编码 1.2 / 0.75，传参报错） | 可调（默认 1.5 / 0.75） |
 | chunk_id 形状 | **≥15 位 hex**（要转 rowid） | 任意 str（空串也放行，只是永不命中） |
 | 打分 | FTS5 `bm25()`（idf 钳到 1e-6） | `BM25Okapi`（idf 有 epsilon floor） |
@@ -143,7 +143,7 @@ except BaseException:
 | `__init__.py` | 对外出口：`BM25Index` / `BM25SearchResult` / `create_bm25` 工厂 |
 | `base/` | 实现无关层：`BM25Index` ABC、`BM25SearchResult`、通用校验（纯函数） |
 | `fts5_bm25/` | FTS5 实现：`index.py`（事务控制）、`_schema.py`（DDL）、`_store.py`（SQL 构造 + rowid）、`tests/` |
-| `rank_bm25/` | rank_bm25 实现：`index.py`、`persistence.py`（pickle 纯数据）、`tests/`。子包与库同名不冲突（Python 3 绝对导入） |
+| `okapi_bm25/` | rank_bm25 实现：`index.py`、`persistence.py`（pickle 纯数据）、`tests/`。**目录名不能叫 `rank_bm25`** —— 与所调用的库（顶层模块）撞名，`bm25/` 一旦进 `sys.path` 就会自我导入报 ImportError |
 | `tests/` | 跨实现：工厂测试 + 两实现的统一契约测试（参数化）+ 通用校验测试。共 148 个用例 |
 
 `python -m pytest simple_rag/repository/bm25`

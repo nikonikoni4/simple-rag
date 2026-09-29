@@ -31,7 +31,7 @@ from simple_rag.tokenization import Tokenizer
 
 from .base import BM25Index, BM25SearchResult
 from .fts5_bm25 import FTS5BM25Index
-from .rank_bm25 import RankBM25Index
+from .okapi_bm25 import RankBM25Index
 
 __all__ = ["BM25Index", "BM25SearchResult", "create_bm25"]
 

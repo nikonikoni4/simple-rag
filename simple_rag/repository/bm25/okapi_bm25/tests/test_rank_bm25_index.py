@@ -7,8 +7,8 @@ import pickle
 import pytest
 
 from simple_rag.repository.bm25 import BM25SearchResult
-from simple_rag.repository.bm25.rank_bm25 import RankBM25Index
-from simple_rag.repository.bm25.rank_bm25.persistence import load, save
+from simple_rag.repository.bm25.okapi_bm25 import RankBM25Index
+from simple_rag.repository.bm25.okapi_bm25.persistence import load, save
 from simple_rag.tokenization import TokenizerFactory
 
 DOC = "向量检索是基于语义的检索方法"
@@ -226,7 +226,7 @@ def test_rebuild空批也写盘(tok, tmp_path):
 def test_rebuild写盘失败_内存保持旧数据(tok, tmp_path, monkeypatch):
     """先写盘再换内存 —— 写盘炸（磁盘满 / 权限）时活索引不能已经换成新数据，
     否则调用方拿到异常却不知道内存里是什么。"""
-    from simple_rag.repository.bm25.rank_bm25 import persistence
+    from simple_rag.repository.bm25.okapi_bm25 import persistence
 
     index = RankBM25Index(tok, persist_path=tmp_path / "bm25.pkl")
     index.rebuild([{"chunk_id": cid(1), "text": DOC}])
