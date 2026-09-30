@@ -10,8 +10,8 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
-    "requests",
-    # rerank_api 的异步 HTTP 客户端（AliyunReranker）
+    # embedding_api / rerank_api 共用的异步 HTTP 客户端
+    # （DoubaoEmbeddingVision、AliyunReranker）
     "httpx",
     "python-dotenv",
     "sqlite-vec",

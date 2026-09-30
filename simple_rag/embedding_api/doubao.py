@@ -4,13 +4,18 @@
 文档：https://docs.volcengine.com/docs/82379/1409290
 
 按服务商分文件：一个服务商一个模块，`doubao` 只管豆包。
+
+**异步** —— `httpx.AsyncClient`，与 `rerank_api/aliyun.py` 同一套生命周期。
+embed 在检索链路上是逐查询调用，挂起等响应而不占线程。
 """
+
+from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-import requests
+import httpx
 
 from simple_rag.config import DoubaoAPIConfig
 
@@ -89,7 +94,11 @@ def _extract_result(payload: dict[str, Any]) -> DoubaoEmbeddingResult:
 
 
 class DoubaoEmbeddingVision:
-    """豆包多模态向量化客户端。一个实例可复用，不做连接池与重试。"""
+    """豆包多模态向量化客户端。一个实例可复用，不做重试。
+
+    异步生命周期：`httpx.AsyncClient` 懒创建（第一次调用时才建，此时必然已在
+    event loop 里），用完 `aclose()`，或直接 `async with` 管理。
+    """
 
     def __init__(
         self,
@@ -105,8 +114,9 @@ class DoubaoEmbeddingVision:
             raise ValueError("缺少 model：构造 DoubaoAPIConfig 时传入，或设置环境变量 DOUBAO_EMBEDDING_MODEL_ID")
         self._config = config
         self._timeout = timeout
+        self._client: httpx.AsyncClient | None = None
 
-    def embed(
+    async def embed(
         self,
         parts: Sequence[Part],
         *,
@@ -137,11 +147,27 @@ class DoubaoEmbeddingVision:
         if sparse:
             body["sparse_embedding"] = {"type": "enabled"}
 
-        response = requests.post(
+        response = await self._get_client().post(
             f"{self._config.api_base.rstrip('/')}/embeddings/multimodal",
             headers={"Authorization": f"Bearer {self._config.api_key}"},
             json=body,
-            timeout=self._timeout,
         )
         response.raise_for_status()
         return _extract_result(response.json())
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self._timeout)
+        return self._client
+
+    async def aclose(self) -> None:
+        """关闭底层连接池。懒创建的 client 用完要关；之后再调用会重新建。"""
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    async def __aenter__(self) -> DoubaoEmbeddingVision:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.aclose()

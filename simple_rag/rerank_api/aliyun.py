@@ -8,12 +8,15 @@
 本类实现统一接口 `Reranker`（见 `base/`）—— 厂商差异（分数方向、index 语义、
 生命周期）全部挡在本模块内，调用方只看 `base.Reranker`。
 
-与 `embedding_api/doubao.py` 的两点差异：
+与 `embedding_api/doubao.py` 的差异：
 
-- **异步** —— `httpx.AsyncClient`（rerank 在检索链路上是逐查询调用，挂起等响应
-  而不占线程）；`requests` 没有异步形态。
 - **不透出分数** —— 输出只有「按相关度排好序的 `chunk_id` + 文本」；分数在内部
   排完序就丢弃（调用方拿排序就够了，方向统一是本类的职责）。
+- **api_base 是完整端点** —— 直接 POST，不再拼路径；豆包那边是 host + 拼
+  `/embeddings/multimodal`。
+
+异步生命周期（`httpx.AsyncClient` 懒创建、`aclose()` 幂等、`async with`）两者
+一致 —— 都是逐查询调用，挂起等响应而不占线程。
 """
 
 from __future__ import annotations
