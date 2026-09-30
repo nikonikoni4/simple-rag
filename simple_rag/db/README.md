@@ -67,7 +67,8 @@ with Database("vec.db") as database:
 |---|---|
 | `__init__.py` | 对外出口：只导出 `Database` |
 | `database.py` | `Database` 类 + `open_connection` 工厂 |
-| `tests/` | 6 个用例。`python -m pytest simple_rag/db` |
+
+测试在 `tests/db/`，6 个用例（`python -m pytest tests/db`）。
 
 `open_connection` **不从 `__init__.py` 导出** —— 要用请走深路径
 `from simple_rag.db.database import open_connection`。

@@ -73,10 +73,11 @@ with Database("vec.db") as database:
 ## 测试
 
 ```bash
-python -m pytest simple_rag/repository -q
+python -m pytest tests/repository -q
 ```
 
-两个子包的测试各自跟着模块走（`vec/tests/`、`bm25/tests/`）。
+测试按模块结构镜像在 `tests/repository/` 下：`vec/` 对应 `vec/`，
+`bm25/` 对应 `bm25/`（再往下分 `fts5_bm25/`、`okapi_bm25/`）。
 
-⚠️ 两个 `tests/` 目录**都没有 `__init__.py`**，pytest 按 basename 导入 ——
-所以测试文件名不能重名，`bm25` 的那几个都带了 `bm25` 前缀。
+⚠️ 这些测试目录**都没有 `__init__.py`**，pytest 按 basename 导入 ——
+不同目录下的测试文件**不能重名**（当前无重名）。加新测试时留意。

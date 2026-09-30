@@ -70,7 +70,8 @@ class PkusegTokenizer:
 | `__init__.py` | 对外出口：协议 + 工厂 + 2 个纯函数 + `JiebaTokenizer` |
 | `base.py` | 注册表、`Tokenizer` 协议、`drop_blank` / `to_document` |
 | `jieba_tokenizer.py` | jieba 实现 |
-| `tests/` | 25 个用例。`python -m pytest simple_rag/tokenization` |
+
+测试在 `tests/tokenization/`，25 个用例（`python -m pytest tests/tokenization`）。
 
 **注册表放在 `base.py` 而不是 `__init__.py`** —— 否则形成
 `__init__ → jieba_tokenizer → __init__` 的循环 import。

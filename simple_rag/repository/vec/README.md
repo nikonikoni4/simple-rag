@@ -120,7 +120,9 @@ Top-K **之前** —— 所以它拿不到「某个字段值下的全部结果�
 | `_schema.py` | Schema 校验 + DDL 生成（纯函数） |
 | `_store.py` | SQL 文本构造 + 记录 / `where` / `k` 的校验（纯函数） |
 | `_codec.py` | 向量归一化 + dtype 统一（纯函数） |
-| `tests/` | 纯单测 3 个 + 端到端 1 个。`python -m pytest simple_rag/repository/vec/tests` |
+
+测试在 `tests/repository/vec/`，纯单测 3 个 + 端到端 1 个
+（`python -m pytest tests/repository/vec`）。
 
 建连接那一层**已移到 [simple_rag/db](../../db/database.py)** —— 本子包不再自己建连接。
 

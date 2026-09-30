@@ -145,5 +145,5 @@ draft.special_content[0].summary                  # 单独拿摘要
 | `md_chunk_by_title.py` | 全部实现：清洗、建树、识别特殊块、并发总结、切分 |
 | `__init__.py` | 空 —— 入口直接从 `md_chunk_by_title` 取 |
 
-测试：`tests/unit/test_md_cut.py`、`test_md_summary.py`、`test_segment_render.py`
-（`python -m pytest tests/unit`）。
+测试：`tests/chunking/structured_file/test_md_cut.py`、`test_md_summary.py`、
+`test_segment_render.py`（`python -m pytest tests/chunking/structured_file`）。

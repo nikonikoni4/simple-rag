@@ -145,11 +145,15 @@ except BaseException:
 |---|---|
 | `__init__.py` | 对外出口：`BM25Index` / `BM25SearchResult` / `create_bm25` 工厂 |
 | `base/` | 实现无关层：`BM25Index` ABC、`BM25SearchResult`、通用校验（纯函数） |
-| `fts5_bm25/` | FTS5 实现：`index.py`（事务控制）、`_schema.py`（DDL）、`_store.py`（SQL 构造 + rowid）、`tests/` |
-| `okapi_bm25/` | rank_bm25 实现：`index.py`、`persistence.py`（pickle 纯数据）、`tests/`。**目录名不能叫 `rank_bm25`** —— 与所调用的库（顶层模块）撞名，`bm25/` 一旦进 `sys.path` 就会自我导入报 ImportError |
-| `tests/` | 跨实现：工厂测试 + 两实现的统一契约测试（参数化）+ 通用校验测试。共 148 个用例 |
+| `fts5_bm25/` | FTS5 实现：`index.py`（事务控制）、`_schema.py`（DDL）、`_store.py`（SQL 构造 + rowid） |
+| `okapi_bm25/` | rank_bm25 实现：`index.py`、`persistence.py`（pickle 纯数据）。**目录名不能叫 `rank_bm25`** —— 与所调用的库（顶层模块）撞名，`bm25/` 一旦进 `sys.path` 就会自我导入报 ImportError |
 
-`python -m pytest simple_rag/repository/bm25`
+测试在 `tests/repository/bm25/`：
+
+- 本层（47 个用例）：跨实现的工厂测试 + 两实现的统一契约测试（参数化）+ 通用校验测试
+- `fts5_bm25/`（71 个）、`okapi_bm25/`（35 个）：各实现自己的测试
+
+整棵子树共 153 个用例（`python -m pytest tests/repository/bm25`）。
 
 ## 为什么 SQL 层不和 `vec` 复用
 
