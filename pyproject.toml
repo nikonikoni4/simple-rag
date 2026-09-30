@@ -11,6 +11,8 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy",
     "requests",
+    # rerank_api 的异步 HTTP 客户端（AliyunReranker）
+    "httpx",
     "python-dotenv",
     "sqlite-vec",
     # tokenization 的内置分词器。**硬依赖，不是 extra** ——

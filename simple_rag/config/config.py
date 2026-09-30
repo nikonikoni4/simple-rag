@@ -44,5 +44,33 @@ class DoubaoAPIConfig:
         self.model = model or os.environ.get("DOUBAO_EMBEDDING_MODEL_ID")
 
 
+class AliyunRerankAPIConfig:
+    """阿里云百炼 rerank API 的接入配置。
+
+    每个字段的优先级：构造时传入 > 环境变量。环境变量带服务商前缀，
+    避免和系统里同名的通用变量（如 `API_KEY`）撞上。
+
+    | 字段 | 环境变量 |
+    |---|---|
+    | `api_base` | `ALY_RERANK_BASE_URL` |
+    | `api_key` | `ALY_API_KEY` |
+    | `model` | `ALY_RERANK_API_MODEL` |
+
+    注意 `api_base` 是**完整的原生 URL**（形如
+    `https://<workspace-id>.cn-beijing.maas.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank`），
+    直接 POST，不要再拼路径 —— 与豆包的「host + 拼路径」用法不同。
+    """
+
+    def __init__(
+        self,
+        api_base: str | None = None,
+        api_key: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        self.api_base = api_base or os.environ.get("ALY_RERANK_BASE_URL")
+        self.api_key = api_key or os.environ.get("ALY_API_KEY")
+        self.model = model or os.environ.get("ALY_RERANK_API_MODEL")
+
+
 class VecDBConfig:
     vec_db_path: Path

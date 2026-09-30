@@ -5,9 +5,10 @@
 对外出口：
 
 - `DoubaoAPIConfig` —— 豆包 API 的 `api_base` / `api_key`
+- `AliyunRerankAPIConfig` —— 阿里云百炼 rerank API 的 `api_base` / `api_key` / `model`
 - `VecDBConfig` —— 向量库配置（占位）
 """
 
-from .config import DoubaoAPIConfig, VecDBConfig
+from .config import AliyunRerankAPIConfig, DoubaoAPIConfig, VecDBConfig
 
-__all__ = ["DoubaoAPIConfig", "VecDBConfig"]
+__all__ = ["AliyunRerankAPIConfig", "DoubaoAPIConfig", "VecDBConfig"]
