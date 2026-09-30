@@ -1,4 +1,4 @@
-# simple_rag/embedding/structed_file —— Markdown 按标题切分
+# simple_rag/chunking/structured_file —— Markdown 按标题切分
 
 把一个 Markdown 文件切成可入库的 chunk。**只认结构（标题 / 代码块 / 表格），
 不认识任何业务概念** —— 什么算一篇文档、有哪些字段、要不要按条件筛选，
@@ -12,8 +12,8 @@
 
 ```python
 from pathlib import Path
-from simple_rag.embedding.structed_file.md_chunk_by_title import chunk_by_title
-from simple_rag.embedding.structed_file.types import render_text
+from simple_rag.chunking.structured_file.md_chunk_by_title import chunk_by_title
+from simple_rag.chunking.structured_file.types import render_text
 
 drafts = chunk_by_title(
     Path("diary/2025-01-16.md"),

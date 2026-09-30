@@ -6,8 +6,8 @@
 import numpy as np
 import pytest
 
-from simple_rag.embedding.structed_file.md_chunk_by_title import chunk_by_title
-from simple_rag.embedding.structed_file.types import Chunk, Segment, SpecialContent, render_text
+from simple_rag.chunking.structured_file.md_chunk_by_title import chunk_by_title
+from simple_rag.chunking.structured_file.types import Chunk, Segment, SpecialContent, render_text
 
 
 def _seg(text: str, *, pref: str = "", start: int = 0, specials=()) -> Segment:

@@ -2,8 +2,8 @@
 
 from pathlib import Path
 
-from simple_rag.embedding.structed_file.types import ChunkDraft, Segment, render_text
-from simple_rag.embedding.structed_file.md_chunk_by_title import (
+from simple_rag.chunking.structured_file.types import ChunkDraft, Segment, render_text
+from simple_rag.chunking.structured_file.md_chunk_by_title import (
     _build_file_tree,
     _clean_file_content,
     _fill_special,

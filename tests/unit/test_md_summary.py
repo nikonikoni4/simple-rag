@@ -7,7 +7,7 @@
 
 import logging
 
-from simple_rag.embedding.structed_file.md_chunk_by_title import (
+from simple_rag.chunking.structured_file.md_chunk_by_title import (
     _build_file_tree,
     _collect_specials,
     _fill_special,
