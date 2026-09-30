@@ -5,9 +5,14 @@ vec_db 两个角色：内容仓库（必然需要，把 chunk_id 变回正文）
 chunk_id 的方式"，它的分数只参与融合，不直接暴露。
 
 两个适配器只做翻译：把各存储的返回变成统一的 RetrievalHit。
+
+全链路异步：embed 是网络调用，async 从 `VecRetriever` 传到 `RetrievalClient`，
+各路召回用 `asyncio.gather` 并发跑。
 """
 
 from __future__ import annotations
+
+import asyncio
 
 from simple_rag.embedding_api import DoubaoEmbeddingVision, TextPart
 from simple_rag.repository.bm25 import BM25Index
@@ -40,7 +45,7 @@ class VecRetriever:
         self._embedding_client = embedding_client
         self._dimensions = dimensions
 
-    def search(self, query: str, k: int) -> list[RetrievalHit]:
+    async def search(self, query: str, k: int) -> list[RetrievalHit]:
         """检索一路。
 
         Args:
@@ -51,8 +56,10 @@ class VecRetriever:
             命中列表，顺序即相关顺序（distance 越小越相关），
             score 是原始 distance。
         """
-        vec = self._embedding_client.embed(
-            [TextPart(query)], dimensions=self._dimensions
+        vec = (
+            await self._embedding_client.embed(
+                [TextPart(query)], dimensions=self._dimensions
+            )
         ).dense
         hits = self._vec_db.search(vec, k)
         return [RetrievalHit(h.chunk_id, h.distance, "vec") for h in hits]
@@ -69,8 +76,11 @@ class BM25Retriever:
         """
         self._bm25_index = bm25_index
 
-    def search(self, query: str, k: int) -> list[RetrievalHit]:
+    async def search(self, query: str, k: int) -> list[RetrievalHit]:
         """检索一路。
+
+        **签名是协程只为满足 `Retriever` 协议** —— 本路走 sqlite 本地调用，
+        没有可挂起的 I/O，所以函数体是同步直调，不套 `asyncio.to_thread`。
 
         Args:
             query: 查询原文，分词由索引内部做。
@@ -170,8 +180,11 @@ class RetrievalClient:
 
     # ---------------------------------------------------------------- 检索
 
-    def search(self, query: str, k: int) -> list[RetrievalResult]:
+    async def search(self, query: str, k: int) -> list[RetrievalResult]:
         """综合检索：各路粗排取 coarse_top_k 条 → RRF 融合 → 截前 k 条 → 回 vec0 补正文。
+
+        各路召回**并发**跑（`asyncio.gather`）—— vec 路要等 embed 的网络往返，
+        串行的话 bm25 路只能干等。
 
         Args:
             query: 查询原文，各路共用。
@@ -184,7 +197,11 @@ class RetrievalClient:
             被静默丢弃，返回条数可能少于 k —— 数据一致性归写入方管，
             检索层不修。
         """
-        lists = [r.search(query, self.coarse_top_k) for r in self._retrievers]
+        lists = list(
+            await asyncio.gather(
+                *(r.search(query, self.coarse_top_k) for r in self._retrievers)
+            )
+        )
         fused = self._rrf(lists)
         results = []
         for chunk_id, score in fused[:k]:

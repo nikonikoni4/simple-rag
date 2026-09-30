@@ -14,9 +14,13 @@ class Retriever(Protocol):
     score 的语义由实现自己定义（vec 是 distance，bm25 是负分），
     只保证「在单路结果内越小越相关」；跨来源比较没有意义，
     融合用的是排名，不是分值。
+
+    `search` 一律是协程 —— 各路要能被 `asyncio.gather` 并发跑。
+    实现内部是不是真异步（vec 走网络 / bm25 直调 sqlite）由实现自己决定，
+    调用方只 `await`。
     """
 
-    def search(self, query: str, k: int) -> list[RetrievalHit]:
+    async def search(self, query: str, k: int) -> list[RetrievalHit]:
         """检索一路。
 
         Args:

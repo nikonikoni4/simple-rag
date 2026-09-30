@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from simple_rag.embedding_api import TextPart
 from simple_rag.retrieval.base import Retriever
 from simple_rag.retrieval.retrieval import BM25Retriever, VecRetriever
@@ -23,7 +25,7 @@ def test_vec_翻译距离为hit且参数透传():
     embedding = FakeEmbedding([0.1, 0.2])
     retriever = VecRetriever(fake_db, embedding, dimensions=8)
 
-    hits = retriever.search("向量检索", k=5)
+    hits = asyncio.run(retriever.search("向量检索", k=5))
 
     assert hits == [
         RetrievalHit("a", 0.1, "vec"),
@@ -41,7 +43,7 @@ def test_vec_翻译距离为hit且参数透传():
 
 def test_vec_不配dimensions则embed收None():
     embedding = FakeEmbedding([0.0])
-    VecRetriever(FakeVecDB([]), embedding, None).search("q", 3)
+    asyncio.run(VecRetriever(FakeVecDB([]), embedding, None).search("q", 3))
     assert embedding.calls[0][1] is None
 
 
@@ -51,7 +53,7 @@ def test_vec_不配dimensions则embed收None():
 def test_bm25_翻译分数为hit且参数透传():
     fake = FakeBM25Index([bm25_row("a", -1.2), bm25_row("b", -3.4)])
 
-    hits = BM25Retriever(fake).search("关键词", 7)
+    hits = asyncio.run(BM25Retriever(fake).search("关键词", 7))
 
     assert hits == [
         RetrievalHit("a", -1.2, "bm25"),

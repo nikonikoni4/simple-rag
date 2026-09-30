@@ -7,6 +7,7 @@ embed 是网络客户端，继续用固定向量替身。
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 
 import pytest
@@ -74,7 +75,7 @@ def client(database):
 
 
 def test_端到端_两路真库融合并返回正文(client):
-    results = client.search("检索", k=3)
+    results = asyncio.run(client.search("检索", k=3))
 
     # 三条全回来（k=3），fields 是 vec0 里的业务字段
     assert len(results) == 3

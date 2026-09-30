@@ -30,13 +30,13 @@ def bm25_row(cid, score=-1.0):
 
 
 class FakeEmbedding:
-    """`embed` 永远返回同一个向量，记录每次调用。"""
+    """`embed` 永远返回同一个向量，记录每次调用。协程 —— 与真客户端签名一致。"""
 
     def __init__(self, dense):
         self._dense = dense
         self.calls: list = []
 
-    def embed(self, parts, *, dimensions=None, **_):
+    async def embed(self, parts, *, dimensions=None, **_):
         self.calls.append((parts, dimensions))
         return SimpleNamespace(dense=self._dense)
 

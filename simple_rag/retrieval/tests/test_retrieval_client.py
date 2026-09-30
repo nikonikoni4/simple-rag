@@ -9,6 +9,8 @@ search 的融合期望值全部手工算好（RRF：第 i 名得 1/(60+i+1)，
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from simple_rag.retrieval.retrieval import RetrievalClient
@@ -77,7 +79,7 @@ def test_融合顺序_手算期望值():
         [bm25_row("b", -0.5), bm25_row("d", -2.0), bm25_row("a", -4.0)],
         rows={cid: vec_row(cid) for cid in "abcd"},
     )
-    results = client.search("q", k=4)
+    results = asyncio.run(client.search("q", k=4))
 
     assert [r.chunk_id for r in results] == ["b", "a", "d", "c"]
     assert results[0].score == pytest.approx(1 / 62 + 1 / 61)
@@ -92,7 +94,7 @@ def test_补正文字段来自vec0():
         [],
         rows={"a": vec_row("a", content="真正的正文")},
     )
-    results = client.search("q", k=3)
+    results = asyncio.run(client.search("q", k=3))
     assert results[0].fields == {"content": "真正的正文"}
 
 
@@ -103,7 +105,7 @@ def test_bm25命中但vec0缺行_静默丢弃():
         [bm25_row("x")],
         rows={"a": vec_row("a")},  # x 在 vec0 里没有
     )
-    results = client.search("q", k=5)
+    results = asyncio.run(client.search("q", k=5))
     assert [r.chunk_id for r in results] == ["a"]
 
 
@@ -117,7 +119,7 @@ def test_融合后截断到k():
         [bm25_row("b", -0.5), bm25_row("d", -2.0), bm25_row("a", -4.0)],
         rows={cid: vec_row(cid) for cid in "abcd"},
     )
-    results = client.search("q", k=2)
+    results = asyncio.run(client.search("q", k=2))
     assert [r.chunk_id for r in results] == ["b", "a"]
 
 
@@ -133,7 +135,7 @@ def test_只配vec一路_不碰bm25():
         embedding_client=FakeEmbedding([1.0]),
         bm25_index=bm25,  # 注入了但没配 → 不该被调
     )
-    results = client.search("q", k=2)
+    results = asyncio.run(client.search("q", k=2))
     assert [r.chunk_id for r in results] == ["a", "b"]
     assert bm25.calls == []
 
@@ -152,7 +154,7 @@ def test_粗排条数透传到各路_k只管最终截断():
         embedding_client=FakeEmbedding([1.0]),
         bm25_index=bm25,
     )
-    results = client.search("q", k=1)
+    results = asyncio.run(client.search("q", k=1))
     assert vec_db.calls[0][1] == 6
     assert bm25.calls == [("q", 6)]
     assert [r.chunk_id for r in results] == ["a"]  # a 两路都第一，融合分最高
@@ -166,6 +168,44 @@ def test_coarse_top_k小于k_返回条数受限于候选池():
         rows={"a": vec_row("a"), "b": vec_row("b")},
         coarse_top_k=1,
     )
-    results = client.search("q", k=5)
+    results = asyncio.run(client.search("q", k=5))
     # 两路各只回第 1 名（都是 a）→ 池里只有 a，b 进不了池
     assert [r.chunk_id for r in results] == ["a"]
+
+
+def test_各路召回并发跑而不是串行():
+    """契约：各路是 `asyncio.gather` 并发 —— vec 路等网络时 bm25 路不该干等。
+
+    验证方式：换两个会在中途让出控制权的替身，看事件顺序。
+    并发 → a 和 b 的 start 都排在 end 之前；串行 → a-start,a-end,b-start,b-end。
+
+    如果失败，说明有人把 gather 改回了串行循环 —— 那 vec 路的网络往返
+    会把其余各路全部堵住。
+    """
+    order: list[str] = []
+
+    class YieldingRetriever:
+        """`search` 中途 `await sleep(0)` 让出控制权，好观察交错。"""
+
+        def __init__(self, name: str) -> None:
+            self._name = name
+
+        async def search(self, query, k):
+            order.append(f"{self._name}-start")
+            await asyncio.sleep(0)
+            order.append(f"{self._name}-end")
+            return []
+
+    client = RetrievalClient(
+        FakeVecDB(),
+        [RetrieverConfig(name="vec"), RetrieverConfig(name="bm25")],
+        coarse_top_k=5,
+        embedding_client=FakeEmbedding([1.0]),
+        bm25_index=FakeBM25Index(),
+    )
+    # 白盒：检索器由构造时的配置建好，这里直接换成会交错的替身
+    client._retrievers = [YieldingRetriever("a"), YieldingRetriever("b")]
+
+    asyncio.run(client.search("q", k=1))
+
+    assert order == ["a-start", "b-start", "a-end", "b-end"]
