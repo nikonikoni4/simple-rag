@@ -149,12 +149,17 @@ def test_同一文件同一内容就是同一条记录():
     assert a.chunk_id == b.chunk_id
 
 
-def test_面包屑参与主键():
-    """标题改名会改 embedding 输入，应当算「内容变了」。"""
+def test_面包屑不参与主键():
+    """身份 = 路径 + 内容指纹，面包屑不进 —— 标题改名不换主键。
+
+    代价记在这里：同一文件里两段正文完全相同、只有祖先标题不同时会撞主键
+    （`Segment.text` 只含自己的标题行，祖先标题在 `pref` 上）。上游按
+    `chunk_id` 去重会吞掉其中一段。用户 2026-10-01 明确选择接受。
+    """
     a = Chunk([_seg("正文。", pref="旧标题")], 5, np.zeros(4))
     b = Chunk([_seg("正文。", pref="新标题")], 5, np.zeros(4))
 
-    assert a.chunk_id != b.chunk_id
+    assert a.chunk_id == b.chunk_id
 
 
 def test_content_hash与路径无关():
@@ -176,10 +181,19 @@ def test_content_hash不含摘要():
     assert before.content_hash == after.content_hash
 
 
-def test_content_hash把面包屑算进去():
-    """标题改名会改 embedding 输入，所以必须改 hash，否则向量会静默过期。"""
+def test_content_hash不含面包屑():
+    """指纹只认正文。面包屑是 embedding 输入的一部分（`render_text` 拼的），
+    但它不是「内容」—— 标题改名没动正文，指纹就该不变。"""
     a = Chunk([_seg("正文。", pref="旧标题")], 5, np.zeros(4))
     b = Chunk([_seg("正文。", pref="新标题")], 5, np.zeros(4))
+
+    assert a.content_hash == b.content_hash
+
+
+def test_content_hash看得到段边界():
+    """各段原文中间有分隔符 —— 否则 ["ab", "c"] 与 ["a", "bc"] 会拼成同一串。"""
+    a = Chunk([_seg("ab"), _seg("c")], 5, np.zeros(4))
+    b = Chunk([_seg("a"), _seg("bc")], 5, np.zeros(4))
 
     assert a.content_hash != b.content_hash
 

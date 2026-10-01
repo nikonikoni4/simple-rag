@@ -216,13 +216,18 @@ class Chunk:
             同一批里出现两条同 id，第二条会撞 `UNIQUE` 约束；而 vec0 抛的是
             `OperationalError`、`sqlite_errorcode` 是通用的 `1`，**只能靠字符串匹配
             判别**，撞了很难查。
-        content_hash: `render_text(segments)`（面包屑 + 正文，`with_summary=False`）的
-            哈希。**和 `chunk_id` 的区别是它不含路径**，所以能回答「这段内容在库里
-            出现过吗」（例如跨文件复用向量、省一次 API 调用）。
+        content_hash: 各段**正文**拼起来的哈希（不含面包屑、不含摘要）。**和
+            `chunk_id` 的区别是它不含路径**，所以能回答「这段内容在库里出现过吗」
+            （例如跨文件复用向量、省一次 API 调用）。
 
             两者都**不含摘要**：摘要是模型生成的、本身不确定，算进去会让每次重跑都
             全量重嵌（主键也跟着变，旧行全成孤儿）。代价是摘要变了两者都不变，
             调用方需要自己判断要不要重嵌。
+
+            两者也都**不含面包屑**：面包屑是 embedding 输入的一部分（由
+            `render_text` 拼），但它不是「内容」—— 标题改名不换身份。代价是同一
+            文件里两段正文完全相同、只有祖先标题不同时会撞主键（祖先标题只在
+            `pref` 上，不在 `Segment.text` 里），上游按 `chunk_id` 去重会吞掉一段。
         parent_id: 预留，将来做 parent 召回时使用。
     """
 
@@ -248,8 +253,11 @@ class Chunk:
         ]
         # 去重指纹：喂给 embedding 的文本没变 -> hash 不变，用来决定要不要重算向量。
         # 摘要不算在内，理由见类 docstring
+        # 只拼各段**正文**：面包屑不进指纹（标题改名没动正文，指纹就该不变）。
+        # 分隔符不能省 —— 否则 ["ab", "c"] 与 ["a", "bc"] 会拼成同一串
         self.content_hash = hashlib.blake2b(
-            render_text(self.segments).encode("utf-8"), digest_size=16
+            "\n\n".join(seg.text for seg in self.segments).encode("utf-8"),
+            digest_size=16,
         ).hexdigest()
         # 主键按**内容**寻址：路径集合 + 内容指纹 -> 同一内容 + 同一组文件就是同一条记录。
         # 行号不参与 —— 位置会随文档增删整体平移，拿它当身份只会让「内容没变也换 ID」。
