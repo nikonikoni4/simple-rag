@@ -860,7 +860,13 @@ def cut(
     return _merge_small_chunks(chunk_list, min_token)
 
 
-def chunk_by_title(file_path:Path,max_token,start_line,end_line=None,summary_func:Callable[[str], str]|None = None,min_token:int|None = None)->list[ChunkDraft]:
+def chunk_by_title(
+    file_path:Path,
+    max_token,
+    start_line,
+    end_line=None,
+    summary_func:Callable[[str], str]|None = None,
+    min_token:int|None = None)->list[ChunkDraft]:
     """按标题把一个 Markdown 文件切成 chunk 草稿。
 
     流程：读取文件 -> 按行切片 -> 清洗 -> 建标题树 -> 并发总结特殊块 -> 切分。
@@ -921,6 +927,25 @@ def chunk_by_title(file_path:Path,max_token,start_line,end_line=None,summary_fun
 
     # 5. 切分
     return cut(filetree, max_token, str(file_path), min_token=min_token)
+
+
+# def chunk_md_files(folder_path:Path,
+#     max_token,
+#     start_line,
+#     end_line=None,
+#     summary_func:Callable[[str], str]|None = None,
+#     min_token:int|None = None)->list[ChunkDraft]:
+#     """
+#     对一个文件夹内所有的md进行切分
+#     原则：不能出现过小的chunk，过小的chunk会影响排序
+#     定义
+#     特殊情况：
+#     1. 若当前只有一个
+
+    
+#     """
+
+
 
 if __name__ =="__main__":
     file_path = Path(r"D:\desktop\软件开发\RAG\data\lifeprismData\diary\2025\01\2025-01-16.md")
