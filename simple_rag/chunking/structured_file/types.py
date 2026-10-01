@@ -55,6 +55,9 @@ class Segment:
         pref: 面包屑，从根标题一路拼到当前标题（含当前标题），分隔符 `" > "`。
             该段不属于任何标题时为空串。
         text: **纯原文片段**，不含面包屑、不含摘要。
+        file_path: 来源文件路径，**原样保留调用方传进来的值**。它不参与 `render`，
+            所以不影响 `content_hash`。跨文件合并后，一个 chunk 的 segments 可能
+            来自不同文件 —— 来源信息记在**段**上，才不会串。
         start_line: 起始行（闭区间，全局，相对清洗后文本）。
         end_line: 结束行（闭区间，全局）。
         tokens: 该段的 token 量预估。
@@ -63,6 +66,7 @@ class Segment:
 
     pref : str
     text : str
+    file_path : str
     start_line : int
     end_line : int
     tokens : int
@@ -117,6 +121,15 @@ def render_text(segments: Sequence[Segment], *, with_summary: bool = False) -> s
     return "\n\n".join(seg.render(with_summary) for seg in segments)
 
 
+def _paths_of(segments: Sequence[Segment]) -> list[str]:
+    """按出现顺序去重，取出各段的来源路径。
+
+    跨文件合并后一个 chunk 的段可能来自多个文件，所以 chunk 级拿到的是一组路径。
+    去重保序：同一文件被切成多段时只记一次，顺序即它第一次出现的位置。
+    """
+    return list(dict.fromkeys(seg.file_path for seg in segments))
+
+
 @dataclass
 class MDFileHead:
     """Markdown 标题树的一个节点（`#` ~ `######`）。
@@ -153,27 +166,28 @@ class ChunkDraft:
     Attributes:
         segments: 按阅读顺序排列的片段。**面包屑在 `Segment.pref` 上，不在 text 里**，
             所以一个 chunk 里混着多个标题的段也不会串，而且原文可以原样拿回来。
-        file_path: 来源文件路径，**原样保留调用方传进来的值**。它直接参与
-            `chunk_id`，所以传相对路径（相对语料根）才能让 ID 跨机器可移植；
-            传绝对路径会把 ID 绑死在这台机器上。
         tokens: 各段 token 之和。自身超限的代码块 / 表格会超过 `max_token`。
-        start_line: 起始行（闭区间，全局），由 `segments` 首段推出。
-        end_line: 结束行（闭区间，全局），由 `segments` 末段推出。
+        file_path: 来源文件路径列表，**由 `segments` 保序去重推出**。跨文件合并后
+            一个 chunk 可能来自多个文件，所以是列表；只有一个来源时是长度为 1 的列表。
+            它直接参与 `chunk_id`，所以传相对路径（相对语料根）才能让 ID 跨机器
+            可移植；传绝对路径会把 ID 绑死在这台机器上。
         special_content: 落在本 chunk 内的代码块 / 表格（带摘要），由各段汇总。
             只是方便取用，不额外存一份 —— 真正的归属在 `Segment.special_content` 上。
+
+    Note:
+        **没有 chunk 级的行区间。** 跨文件合并后，一对 `(start, end)` 表达不了
+        「这个 chunk 覆盖哪些位置」—— 它可能跨了两个文件，行号也就分属两套。
+        位置信息记在 `Segment` 粒度上，需要时按 `file_path` 分组取。
     """
 
     segments : list[Segment]
-    file_path : str
     tokens : int
-    start_line : int = None # post_init
-    end_line : int = None # post_init
+    file_path : list[str] = None # post_init
     special_content : list[SpecialContent] = field(default_factory=list) # post_init
 
     def __post_init__(self):
-        """行区间与 `special_content` 都从 `segments` 推导，不接受外部传入。"""
-        self.start_line = self.segments[0].start_line
-        self.end_line = self.segments[-1].end_line
+        """`file_path` 与 `special_content` 都从 `segments` 推导，不接受外部传入。"""
+        self.file_path = _paths_of(self.segments)
         self.special_content = [
             block for seg in self.segments for block in seg.special_content
         ]
@@ -185,17 +199,14 @@ class Chunk:
 
     Attributes:
         segments: 同 `ChunkDraft.segments`。
-        file_path: 来源文件路径。**直接参与 `chunk_id`** —— 传相对路径才能跨机器
-            可移植，传绝对路径会把主键绑死在这台机器上。
+        file_path: 来源文件路径列表，**由 `segments` 保序去重推出**（同 `ChunkDraft`）。
+            跨文件合并后可能来自多个文件，所以是列表；只有一个来源时长度为 1。
         tokens: token 量预估。
         embedding_vec: 向量。构造时可传 `list[float]`（API 常见格式）、`tuple[float]`
             或 `ndarray`；`__post_init__` 统一转成 float32 的 ndarray。
         special_content: 落在本 chunk 内的代码块 / 表格。**摘要挂在这里**，不在
             `segments` 里 —— 所以入库之后 agent 仍然能单独拿到摘要。
-        start_line: 起始行（闭区间），由 `segments` 首段推出。**只是参考信息，不再是
-            唯一标识** —— 同一行被切成多段时，几段的行区间会完全相同。
-        end_line: 结束行（闭区间），由 `segments` 末段推出。同上，仅作参考。
-        chunk_id: 主键，**按内容寻址**：`H(file_path + content_hash)`。
+        chunk_id: 主键，**按内容寻址**：`H(路径集合 + content_hash)`。
             内容一样就是同一条记录（不必存两份），内容变了主键就变。
             路径参与主键，所以同内容不同文件仍是两条 —— 换来的好处是「按 `file_path`
             删」这种更新方式不会误删别的文件；若改成全局内容寻址，跨文件重复的内容
@@ -216,25 +227,22 @@ class Chunk:
     """
 
     segments : list[Segment]
-    file_path : str
     tokens : int
     # 入参和持有都用这个联合类型：API 返回 list[float]，本地模型给 ndarray，
     # 两者都能直接交给 VecStore（它的入参就是 Sequence[float] | ndarray）。
     # __post_init__ 会把 list 转成 ndarray 省内存，所以构造完运行期一定是 ndarray
     embedding_vec: Sequence[float] | np.ndarray # post_init
+    file_path : list[str] = None # post_init
     special_content : list[SpecialContent] = field(default_factory=list) # post_init
-    start_line : int = None # post_init
-    end_line : int = None # post_init
     chunk_id : str = None # post_init
     content_hash : str = None # post_init
     parent_id : str = None # 预留,若后面要做parent召回时使用
 
     def __post_init__(self):
-        """推导行区间、`special_content`、`content_hash` 与 `chunk_id`，并统一向量 dtype。"""
+        """推导 `file_path`、`special_content`、`content_hash` 与 `chunk_id`，并统一向量 dtype。"""
         # list[float] -> ndarray：1536 维从 ~48KB 降到 ~6KB
         self.embedding_vec = np.asarray(self.embedding_vec, dtype=np.float32)
-        self.start_line = self.segments[0].start_line
-        self.end_line = self.segments[-1].end_line
+        self.file_path = _paths_of(self.segments)
         self.special_content = [
             block for seg in self.segments for block in seg.special_content
         ]
@@ -243,9 +251,12 @@ class Chunk:
         self.content_hash = hashlib.blake2b(
             render_text(self.segments).encode("utf-8"), digest_size=16
         ).hexdigest()
-        # 主键按**内容**寻址：文件路径 + 内容指纹 -> 同一内容 + 同一文件就是同一条记录。
+        # 主键按**内容**寻址：路径集合 + 内容指纹 -> 同一内容 + 同一组文件就是同一条记录。
         # 行号不参与 —— 位置会随文档增删整体平移，拿它当身份只会让「内容没变也换 ID」。
-        # 内容改由调用方按 file_path 清掉旧行（见类 docstring）。
-        # \x00 当分隔符：路径和十六进制指纹里都不可能含它，避免拼接歧义
-        key = f"{self.file_path}\x00{self.content_hash}"
+        # 内容改由调用方按 path 清掉旧行（见类 docstring）。
+        # 路径**排序后**再拼：跨文件合并使路径可能来自多个文件，而合并顺序不保证稳定，
+        # 同一组文件必须落到同一个 ID 上。\x00 隔开各路径、\x01 隔开路径段与指纹 ——
+        # 两者都不可能出现在路径或十六进制指纹里
+        paths = "\x00".join(sorted(self.file_path))
+        key = f"{paths}\x01{self.content_hash}"
         self.chunk_id = hashlib.blake2b(key.encode("utf-8"), digest_size=16).hexdigest()

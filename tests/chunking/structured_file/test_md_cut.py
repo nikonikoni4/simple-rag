@@ -8,9 +8,10 @@ from simple_rag.chunking.structured_file.md_chunk_by_title import (
     _clean_file_content,
     _fill_special,
     _locate_spans,
-    _merge_small_chunks,
     chunk_by_title,
+    chunk_md_files,
     cut,
+    merge_small_chunks,
 )
 
 
@@ -23,6 +24,19 @@ def _write(tmp_path: Path, md: str) -> Path:
 def _text(draft) -> str:
     """chunk 的完整文本（面包屑 + 正文），检查内容用。"""
     return render_text(draft.segments)
+
+
+def _start(draft) -> int:
+    """chunk 的起始行 —— chunk 级已不再存这对值，这里取首段的起点。
+
+    这些用例都是单文件的，所以「首段起点 / 末段终点」仍是有效的行区间。
+    """
+    return draft.segments[0].start_line
+
+
+def _end(draft) -> int:
+    """chunk 的结束行 —— 取末段的终点。"""
+    return draft.segments[-1].end_line
 
 
 def _tree_of(md: str):
@@ -51,7 +65,7 @@ def test_整篇装得下时只出一个chunk(tmp_path):
     assert len(drafts) == 1
     assert "正文。" in _text(drafts[0])
     assert "子正文。" in _text(drafts[0])
-    assert drafts[0].start_line == 0
+    assert _start(drafts[0]) == 0
 
 
 def test_多个节点装得下就合并成一个chunk(tmp_path):
@@ -93,10 +107,10 @@ def test_chunk按阅读顺序推进到文末(tmp_path):
     drafts = chunk_by_title(_write(tmp_path, md), max_token=60, start_line=0)
 
     total_lines = len(md.splitlines())
-    assert drafts[0].start_line == 0
-    assert drafts[-1].end_line == total_lines - 1
+    assert _start(drafts[0]) == 0
+    assert _end(drafts[-1]) == total_lines - 1
     for before, after in zip(drafts, drafts[1:]):
-        assert after.end_line >= before.end_line
+        assert _end(after) >= _end(before)
 
 
 def test_重叠_下半段会回溯进上半段的范围(tmp_path):
@@ -105,8 +119,8 @@ def test_重叠_下半段会回溯进上半段的范围(tmp_path):
 
     assert len(drafts) > 1
     first, second = drafts[0], drafts[1]
-    assert second.start_line < first.end_line  # 回溯 -> 行号区间重叠
-    assert second.start_line > first.start_line  # 但没有回溯到节点开头
+    assert _start(second) < _end(first)  # 回溯 -> 行号区间重叠
+    assert _start(second) > _start(first)  # 但没有回溯到节点开头
 
 
 def test_重叠_重叠区的每一行在上下两块里都出现(tmp_path):
@@ -116,7 +130,7 @@ def test_重叠_重叠区的每一行在上下两块里都出现(tmp_path):
     first, second = drafts[0], drafts[1]
     # 本文档没有连续空行，清洗不会挪行号，所以 md 的行号 == chunk 的行号
     lines = md.splitlines()
-    overlap = lines[second.start_line : first.end_line + 1]
+    overlap = lines[_start(second) : _end(first) + 1]
     assert overlap, "相邻两块之间应该有重叠区"
     for line in overlap:
         assert line in _text(first)
@@ -132,7 +146,7 @@ def test_重叠_可以关掉(tmp_path):
 
     assert len(drafts) > 1
     for before, after in zip(drafts, drafts[1:]):
-        assert after.start_line == before.end_line + 1
+        assert _start(after) == _end(before) + 1
 
 
 def test_代码块不会被从中间切开(tmp_path):
@@ -160,7 +174,7 @@ def test_切点贴着代码块时不会退化成一行一推进(tmp_path):
     drafts = chunk_by_title(_write(tmp_path, md), max_token=60, start_line=0)
 
     assert len(drafts) <= 5
-    starts = [d.start_line for d in drafts]
+    starts = [_start(d) for d in drafts]
     assert len(starts) == len(set(starts))
 
 
@@ -217,7 +231,7 @@ def test_超长单行会被行内切开(tmp_path):
     assert len(drafts) > 1
     assert all(d.tokens <= 60 for d in drafts)
     # 多段来自同一行：行号一样，只靠内容区分（主键也按内容算，所以不会撞）
-    same_line = [d for d in drafts if d.start_line == d.end_line == 2]
+    same_line = [d for d in drafts if _start(d) == _end(d) == 2]
     assert len(same_line) > 1
     # 内容不丢（有重叠，所以是 >=）
     assert "".join(_text(d) for d in drafts).count("甲") >= 500
@@ -228,7 +242,7 @@ def test_行内切_优先落在句末标点之后(tmp_path):
     md = f"# 标题\n\n{sentence * 8}\n"
     drafts = chunk_by_title(_write(tmp_path, md), max_token=100, start_line=0)
 
-    body = [d for d in drafts if d.start_line == 2]
+    body = [d for d in drafts if _start(d) == 2]
     assert len(body) > 1
     for draft in body[:-1]:  # 最后一段是收尾，不要求标点
         assert _text(draft).rstrip().endswith(("。", "！", "？", "；", "!", "?", ";"))
@@ -238,7 +252,7 @@ def test_行内切_没有标点就按字符硬切(tmp_path):
     md = f"# 标题\n\n{'x' * 600}\n"
     drafts = chunk_by_title(_write(tmp_path, md), max_token=60, start_line=0)
 
-    body = [d for d in drafts if d.start_line == 2]
+    body = [d for d in drafts if _start(d) == 2]
     assert len(body) > 1
     assert all(d.tokens <= 60 for d in body)
 
@@ -263,7 +277,7 @@ def test_前导空行不会切出空chunk(tmp_path):
     drafts = chunk_by_title(_write(tmp_path, md), max_token=60, start_line=0)
 
     assert all(_text(d).strip() for d in drafts)
-    assert drafts[0].start_line == 0  # 前导空行跟着第一段走，没有被单独扔出来
+    assert _start(drafts[0]) == 0  # 前导空行跟着第一段走，没有被单独扔出来
     assert "".join(_text(d) for d in drafts).count("甲") >= 500
 
 
@@ -272,7 +286,7 @@ def test_大文档不会死循环且chunk不重复(tmp_path):
     drafts = chunk_by_title(_write(tmp_path, md), max_token=60, start_line=0)
 
     assert len(drafts) < 200  # 有重叠但不会退化成「一行一个 chunk」
-    ids = [d.start_line for d in drafts]
+    ids = [_start(d) for d in drafts]
     assert len(ids) == len(set(ids))  # 起始行互不相同 -> chunk_id 不会撞
 
 
@@ -283,16 +297,17 @@ def test_大文档不会死循环且chunk不重复(tmp_path):
 # 让它们只作为上下文存在，不再单独参与召回。
 
 
-def _draft(tokens: int, start_line: int) -> ChunkDraft:
+def _draft(tokens: int, start_line: int, file_path: str = "doc.md") -> ChunkDraft:
     """造一个只含一段的 chunk，token 数可控 —— 单独测合并逻辑用。"""
     seg = Segment(
         pref="标题",
         text="正文",
+        file_path=file_path,
         start_line=start_line,
         end_line=start_line,
         tokens=tokens,
     )
-    return ChunkDraft(segments=[seg], file_path="doc.md", tokens=tokens)
+    return ChunkDraft(segments=[seg], tokens=tokens)
 
 
 def _shape(chunks) -> list[int]:
@@ -301,78 +316,164 @@ def _shape(chunks) -> list[int]:
 
 
 def test_短块并进上一个():
-    assert _shape(_merge_small_chunks([_draft(100, 0), _draft(5, 1)], 30)) == [105]
+    assert _shape(merge_small_chunks([_draft(100, 0), _draft(5, 1)], 30)) == [105]
 
 
 def test_短块没有上一个就并进下一个():
-    assert _shape(_merge_small_chunks([_draft(5, 0), _draft(100, 1)], 30)) == [105]
+    assert _shape(merge_small_chunks([_draft(5, 0), _draft(100, 1)], 30)) == [105]
 
 
 def test_短块两边都没有就丢弃():
-    assert _merge_small_chunks([_draft(5, 0)], 30) == []
+    assert merge_small_chunks([_draft(5, 0)], 30) == []
 
 
 def test_连续短块都并进上一个():
     chunks = [_draft(100, 0), _draft(5, 1), _draft(6, 2)]
-    assert _shape(_merge_small_chunks(chunks, 30)) == [111]
+    assert _shape(merge_small_chunks(chunks, 30)) == [111]
 
 
 def test_开头的连续短块并进下一个():
     chunks = [_draft(5, 0), _draft(6, 1), _draft(100, 2)]
-    assert _shape(_merge_small_chunks(chunks, 30)) == [111]
+    assert _shape(merge_small_chunks(chunks, 30)) == [111]
 
 
 def test_整篇只有短块时合成一个而不是全丢():
-    assert _shape(_merge_small_chunks([_draft(5, 0), _draft(6, 1)], 30)) == [11]
+    assert _shape(merge_small_chunks([_draft(5, 0), _draft(6, 1)], 30)) == [11]
 
 
 def test_没有短块时原样返回():
     chunks = [_draft(100, 0), _draft(200, 1)]
-    assert _merge_small_chunks(chunks, 30) == chunks
+    assert merge_small_chunks(chunks, 30) == chunks
 
 
 def test_合并把段拼起来而不是丢掉():
-    merged = _merge_small_chunks([_draft(100, 0), _draft(5, 1)], 30)
+    merged = merge_small_chunks([_draft(100, 0), _draft(5, 1)], 30)
 
     assert len(merged) == 1
     assert len(merged[0].segments) == 2
 
 
 def test_合并后行区间连续():
-    merged = _merge_small_chunks([_draft(5, 0), _draft(100, 1), _draft(5, 2)], 30)
+    merged = merge_small_chunks([_draft(5, 0), _draft(100, 1), _draft(5, 2)], 30)
 
     assert _shape(merged) == [110]  # 末尾那个短块并进上一个
-    assert (merged[0].start_line, merged[0].end_line) == (0, 2)
+    assert (_start(merged[0]), _end(merged[0])) == (0, 2)
 
 
-def test_不传min_token时不做合并(tmp_path):
-    """默认行为不变：短块照样单独成 chunk。"""
+def test_切分本身不做合并(tmp_path):
+    """`chunk_by_title` 只负责切割：短块照样单独成 chunk，合并在外面显式调用。"""
     md = f"# 标题\n\n{_paras(30)}\n\n# 尾\n\n短。\n"
     drafts = chunk_by_title(_write(tmp_path, md), max_token=60, start_line=0)
 
     assert min(d.tokens for d in drafts) < 30
 
 
-def test_传min_token后短块被并进邻居(tmp_path):
+def test_合并后短块被并进邻居(tmp_path):
     md = f"# 标题\n\n{_paras(30)}\n\n# 尾\n\n短。\n"
-    drafts = chunk_by_title(_write(tmp_path, md), max_token=60, start_line=0, min_token=30)
+    drafts = chunk_by_title(_write(tmp_path, md), max_token=60, start_line=0)
 
-    assert all(d.tokens >= 30 for d in drafts)
+    assert all(d.tokens >= 30 for d in merge_small_chunks(drafts, 30))
 
 
 def test_开头的短块并进下一个chunk(tmp_path):
     """文档以一小段正文开头、后面跟超长正文时，开头那段会被单独 flush 出来。"""
     md = "前导一小段。\n\n# 标题\n\n" + "甲" * 300 + "\n"
-    drafts = chunk_by_title(_write(tmp_path, md), max_token=60, start_line=0, min_token=30)
+    drafts = chunk_by_title(_write(tmp_path, md), max_token=60, start_line=0)
+    merged = merge_small_chunks(drafts, 30)
 
-    assert all(d.tokens >= 30 for d in drafts)
-    assert "前导一小段" in _text(drafts[0])
-    assert "甲" in _text(drafts[0])
+    assert all(d.tokens >= 30 for d in merged)
+    assert "前导一小段" in _text(merged[0])
+    assert "甲" in _text(merged[0])
 
 
 def test_整篇只有一个短块时返回空列表(tmp_path):
-    drafts = chunk_by_title(
-        _write(tmp_path, "# 标题\n"), max_token=1000, start_line=0, min_token=30
-    )
+    drafts = chunk_by_title(_write(tmp_path, "# 标题\n"), max_token=1000, start_line=0)
 
-    assert drafts == []
+    assert merge_small_chunks(drafts, 30) == []
+
+
+# ------------------------------------------------------- 跨文件合并（chunk_md_files）
+
+
+def test_跨文件合并把小文件并进邻居(tmp_path):
+    """`chunk_md_files` 存在的理由：小文件自己凑不满一块，跨文件才有邻居。"""
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    (folder / "a.md").write_text("# A\n\n短。\n", encoding="utf-8")
+    (folder / "b.md").write_text("# B\n\n" + "乙" * 300 + "\n", encoding="utf-8")
+
+    drafts = chunk_md_files(folder, max_token=400, min_token=30)
+
+    assert len(drafts) == 1  # a 并进了 b
+    assert drafts[0].file_path == [
+        (folder / "a.md").as_posix(),
+        (folder / "b.md").as_posix(),
+    ]
+    assert "短。" in _text(drafts[0])
+    assert "乙" in _text(drafts[0])
+
+
+def test_跨文件合并不改变单一来源(tmp_path):
+    """没被合并的块，来源仍是它自己那一个文件。"""
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    (folder / "a.md").write_text("# A\n\n" + "甲" * 300 + "\n", encoding="utf-8")
+
+    drafts = chunk_md_files(folder, max_token=60, min_token=30)
+
+    assert drafts
+    assert all(d.file_path == [(folder / "a.md").as_posix()] for d in drafts)
+
+
+def test_段的来源不因合并而串(tmp_path):
+    """合并进来的段带着**自己**的路径，而不是整块的第一个路径。"""
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    (folder / "a.md").write_text("# A\n\n短。\n", encoding="utf-8")
+    (folder / "b.md").write_text("# B\n\n" + "乙" * 300 + "\n", encoding="utf-8")
+
+    chunk = chunk_md_files(folder, max_token=400, min_token=30)[0]
+
+    a_segs = [s for s in chunk.segments if s.file_path == (folder / "a.md").as_posix()]
+    b_segs = [s for s in chunk.segments if s.file_path == (folder / "b.md").as_posix()]
+    assert a_segs and b_segs
+    assert len(a_segs) + len(b_segs) == len(chunk.segments)
+
+
+def test_文件夹为空时返回空列表(tmp_path):
+    folder = tmp_path / "docs"
+    folder.mkdir()
+
+    assert chunk_md_files(folder, max_token=60, min_token=30) == []
+
+
+# ------------------------------------------------------- 段里记的路径
+
+
+def test_source_name决定段里记的路径(tmp_path):
+    """读文件用文件路径，写进段里的是另一个串 —— ID 的可移植性靠后者。"""
+    path = _write(tmp_path, "# 标题\n\n正文。\n")
+
+    drafts = chunk_by_title(path, max_token=1000, start_line=0, source_name="docs/a.md")
+
+    assert drafts[0].file_path == ["docs/a.md"]
+    assert drafts[0].segments[0].file_path == "docs/a.md"
+
+
+def test_不传source_name时用文件路径(tmp_path):
+    path = _write(tmp_path, "# 标题\n\n正文。\n")
+
+    drafts = chunk_by_title(path, max_token=1000, start_line=0)
+
+    assert drafts[0].file_path == [str(path)]
+
+
+def test_chunk_md_files的路径统一用正斜杠(tmp_path):
+    """段里记 POSIX 形式，所以路径分隔符的差异不会渗进 chunk_id。"""
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    (folder / "a.md").write_text("# A\n\n" + "甲" * 300 + "\n", encoding="utf-8")
+
+    drafts = chunk_md_files(folder, max_token=400, min_token=30)
+
+    assert drafts[0].file_path == [(folder / "a.md").as_posix()]

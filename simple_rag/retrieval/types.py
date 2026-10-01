@@ -2,6 +2,7 @@
 
 - `RetrieverConfig` —— 启用哪个检索方式（RetrievalClient 的配置项）
 - `RetrievalHit` —— 检索方式的统一中间结果，只用于融合，不对外
+- `SourceRef` / `RetrievalResult` —— `search` 的最终返回
 """
 
 from __future__ import annotations
@@ -44,15 +45,31 @@ class RetrievalHit:
 
 
 @dataclass(frozen=True)
+class SourceRef:
+    """一条来源：哪个文件的哪几行。
+
+    跨文件合并会让一个 chunk 有多条来源，所以 `RetrievalResult.sources` 是列表。
+    """
+
+    path: str
+    start_line: int
+    end_line: int
+
+
+@dataclass(frozen=True)
 class RetrievalResult:
-    """search 的最终返回 —— RRF 融合后回 vec0 补过正文的命中。
+    """search 的最终返回 —— RRF 融合后回**数据表**补齐正文与来源的命中。
 
     Attributes:
         chunk_id: 命中的 chunk id。
         score: RRF 累计分，越大越靠前。
-        fields: vec0 里这一行的全部业务字段，正文在内。
+        content: 正文。
+        sources: 来源列表，按 `path` / `start_line` 排好序。跨文件合并的块会有多条。
+        fields: 调用方在数据表上声明的扩展列。
     """
 
     chunk_id: str
     score: float  # RRF 累计分，越大越靠前
+    content: str
+    sources: list[SourceRef]
     fields: dict[str, str | None]

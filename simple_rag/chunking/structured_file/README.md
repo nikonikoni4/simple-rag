@@ -12,16 +12,26 @@
 
 ```python
 from pathlib import Path
-from simple_rag.chunking.structured_file.md_chunk_by_title import chunk_by_title
+from simple_rag.chunking.structured_file.md_chunk_by_title import (
+    chunk_by_title,
+    chunk_md_files,
+    merge_small_chunks,
+)
 from simple_rag.chunking.structured_file.types import render_text
 
+# 单个文件：只切割
 drafts = chunk_by_title(
     Path("diary/2025-01-16.md"),
     max_token=1024,
     start_line=0,
     summary_func=my_summarize,   # 可选；模块不绑定任何模型服务，传 None 就整步跳过
-    min_token=30,                # 可选；短块阈值，None = 不合并。见「短块合并」
 )
+
+# 整个文件夹：逐文件切割 → 汇总 → 跨文件合并小 chunk
+drafts = chunk_md_files(Path("diary"), max_token=1024, min_token=30)
+
+# 想自己控制时，两步分开写（chunk_md_files 内部就是这两步）
+drafts = merge_small_chunks(drafts, min_token=30)
 
 text = render_text(drafts[0].segments, with_summary=True)   # 送进 embedding 的文本
 ```
@@ -60,17 +70,42 @@ text = render_text(drafts[0].segments, with_summary=True)   # 送进 embedding �
 都能召回。切点是被特殊块顶回来的话**不留重叠**：否则下半段会从重叠处再切一次、
 又退到同一个切点，切出一块被上一块完全包住的重复 chunk。
 
-**短块合并** —— `min_token` 非 `None` 时，`tokens` 小于它的 chunk 会被并进相邻
-chunk：优先并进**上一个**（短块多半是紧跟大块之后被 flush 出来的），没有上一个就
-并进**下一个**（文档开头就是短块时），两边都没有就**丢弃**（整篇只切出一个短块）。
-合并只拼相邻块，**不重新装箱**，所以合并后的 chunk 可能超过 `max_token` —— 这是
-刻意的取舍，短块单独成块对检索的伤害比这一点溢出大。
+## 短块合并（独立接口，不嵌在切分里）
+
+**切分不做合并。** `cut` / `chunk_by_title` 只负责切割，合并是另一个函数：
+
+```python
+drafts = merge_small_chunks(drafts, min_token=30)
+```
+
+**为什么拆开**：切分与合并是两个正交的决策；而且**跨文件合并必须先拿到全部文件的
+结果**，嵌在切分里就永远只看得到单个文件。`chunk_md_files` 正是靠这一点，把「自身
+不足一个 chunk 的小文件」并进相邻文件的块，而不是丢掉。
+
+归宿按优先级逐块扫一遍决定：
+
+1. **并进上一个** —— 短块多半是紧跟大块之后被 flush 出来的，并回去最自然
+2. **没有上一个就并进下一个** —— 文档开头就是短块时；下一个还没出现，先攒着
+3. **两边都没有就丢弃** —— 整篇只切出一个短块，没有可依附的邻居
+
+合并只拼相邻块、**不重新装箱**，所以合并后的 chunk 可能超过 `max_token` —— 这是
+刻意的取舍：短块单独成块对检索的伤害比这一点溢出大。
 
 短 chunk 在检索里会当「吸引子」：文本越短，向量越「通用」，跟什么查询都不算远。
-实测一个 13 token 的块在多个不相关查询里排到第 1，把正确答案挤到第 2。
+实测（[干扰块实验](../../../explore/实际测试/e2e检索测试/干扰块实验.md)）注入 52 个
+24 token 的沾边小块后，**单路向量检索的 MRR@10 从 0.804 掉到 0.372**、Hit@1 从
+65.4% 掉到 15.4%；BM25 侧只掉 0.019，但这批短块被算进平均文档长度，使 fts5 的
+avgdl 从 724.5 降到 609。
+
 **`min_token` 不给默认值** —— 取多少得按自己的语料实测，见下。
 
 ### 实测：`data/` 全部语料（385 个文件，`max_token=1024`）
+
+> ⚠️ **此表按「逐文件合并」的旧口径测得**（当时 `min_token` 还在 `chunk_by_title`
+> 里，所以「某个文件返回空列表」是个有意义的状态）。现在合并发生在 `chunk_md_files`
+> 汇总之后，返回的是整批的列表 —— 那个概念已经不存在。数字仍有参考价值（短块
+> 消化掉、chunk 数下降、超限变多这三个结论不受影响），但**要按当前实现重新度量**，
+> 得用 `chunk_md_files` 的口径重跑一遍。
 
 | `min_token` | chunk 数 | 剩余 `<30` | 超 `1024` | 返回空列表的文件 |
 |---|---|---|---|---|
@@ -93,11 +128,22 @@ chunk：优先并进**上一个**（短块多半是紧跟大块之后被 flush �
 ```
 MDFileHead   标题树节点（中间结构，只承载结构与 token 统计）
     ↓ 切分
-Segment      一段：面包屑 + 纯正文 + 行区间 + 落在本段内的特殊块
+Segment      一段：面包屑 + 纯正文 + 来源（file_path + 行区间）+ 落在本段内的特殊块
     ↓ 装箱
 ChunkDraft   一个 chunk：若干 Segment（还没有向量）
+    ↓ merge_small_chunks（可选；跨文件合并也在这里）
     ↓ embedding
 Chunk        最终产物，带向量，可直接交给 VecDB
+```
+
+**来源信息（`file_path` + 行区间）记在 `Segment` 上，不在 chunk 上。** 跨文件合并后
+一个 chunk 可能来自多个文件，`ChunkDraft.file_path` / `Chunk.file_path` 因此是
+**保序去重的列表**；chunk 级**没有**行区间 —— 一对 `(start, end)` 表达不了跨文件
+的覆盖范围。需要位置时按段取：
+
+```python
+draft.file_path                     # ['a.md', 'b.md'] —— 这一块涉及的文件
+[(s.file_path, s.start_line) for s in draft.segments]   # 每段的来源
 ```
 
 **面包屑和摘要都不写进 `Segment.text`。** 存的时候分开存，用的时候才拼 ——
@@ -120,29 +166,30 @@ draft.special_content[0].summary                  # 单独拿摘要
 |---|---|
 | **`max_token` 是软约束** | 两种突破：① 原子块自己就超预算 —— 整块保留。纯文本本身不会超限 ② 短块合并把内容塞进已经装满的邻居 |
 | **`max_token` 不含摘要** | 送进 embedding 的文本 = 面包屑 + 正文 + 本 chunk 内所有摘要。设 `max_token` 时自行留余量 |
-| **`min_token` 不给默认值** | 短块阈值由调用方按自己的语料实测决定，模块只给开关。`None` = 不合并，短块会留在结果里 |
-| **可能返回空列表** | 给了 `min_token` 且整篇只切出一个短块时。语料里的「空壳日记」会走这条路 —— 这是刻意的 |
+| **`merge_small_chunks` 的 `min_token` 不给默认值** | 短块阈值由调用方按自己的语料实测决定，模块只给参数、不给建议值 |
+| **`merge_small_chunks` 可能返回空列表** | 整批只切出一个短块时（没有可依附的邻居）。语料里的「空壳日记」会走这条路 —— 这是刻意的 |
 | **摘要是可选、且会软失败** | `summary_func` 由调用方注入。单个块抛异常只记 `logging.warning`，该块 `summary` 留 `None`，不中断其余块 |
-| **`chunk_id` 按内容寻址** | `H(file_path + content_hash)`，**行号不参与**。内容一样就是同一条记录；内容变了主键就变，旧行要调用方按 `file_path` 清掉 |
+| **`chunk_id` 按内容寻址** | `H(路径集合 + content_hash)`，**行号不参与**。路径排序后再拼 —— 合并顺序变了主键也不变。内容变了主键就变，旧行要调用方按 `path` 清掉 |
 | ⚠️ **入库前必须按 `chunk_id` 去重** | 一批内 + 库里已有的都要。同 id 撞的是 `UNIQUE`，而 vec0 抛 `OperationalError`、`sqlite_errorcode` 是通用的 `1`，只能字符串匹配 |
-| **`file_path` 原样保留传入值** | 它直接参与主键。传相对路径（相对语料根）才能跨机器可移植；传绝对路径会把主键绑死在这台机器上 |
+| **`file_path` 是列表，原样保留传入值** | 跨文件合并后可能多个（保序去重）。它直接参与主键，所以传相对路径（相对语料根）才能跨机器可移植；传绝对路径会把主键绑死在这台机器上 |
 | **行号相对清洗后文本** | `_clean_file_content` 会吃掉连续空行，所以不等于原文件行号，映射不是简单加偏移 |
-| **行号只是参考信息** | 同一行切出的多段，`start_line` / `end_line` 完全相同。别拿它当唯一标识 |
+| **行号只在 `Segment` 上** | chunk 级**没有**行区间（跨文件后一对 `(start, end)` 没有意义）。同一行切出的多段，段的 `start_line` / `end_line` 完全相同，别拿它当唯一标识 |
 
 ## 已知限制
 
 1. **代码围栏里的 `# 注释` 会被误判成标题**；Setext 式标题（下一行跟 `===`）不识别
 2. **标题跳级**（`#` 直接到 `###`）不报错，按「就近挂到栈顶父节点」处理
 3. **摘要变了 `content_hash` / `chunk_id` 都不变** —— 要不要重嵌得调用方自己判断
-4. **默认不合并短块** —— 不传 `min_token` 时短块照样单独成 chunk，会在检索里当
-   「吸引子」。传 `min_token` 可以消除，但阈值得自己实测（见「短块合并」）
+4. **切分不合并短块** —— `chunk_by_title` 只切割，短块照样单独成 chunk，会在检索里
+   当「吸引子」。要消除得显式调 `merge_small_chunks`（或直接用 `chunk_md_files`），
+   阈值得自己实测（见「短块合并」）
 
 ## 文件
 
 | 文件 | 职责 |
 |---|---|
 | `types.py` | 跨步骤类型：`MDFileHead` / `SpecialContent` / `Segment` / `ChunkDraft` / `Chunk`，以及拼装用的 `render_text` |
-| `md_chunk_by_title.py` | 全部实现：清洗、建树、识别特殊块、并发总结、切分 |
+| `md_chunk_by_title.py` | 全部实现：清洗、建树、识别特殊块、并发总结、切分、短块合并、跨文件切分 |
 | `__init__.py` | 空 —— 入口直接从 `md_chunk_by_title` 取 |
 
 测试：`tests/chunking/structured_file/test_md_cut.py`、`test_md_summary.py`、

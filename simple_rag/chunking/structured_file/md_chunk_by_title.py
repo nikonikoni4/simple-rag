@@ -387,16 +387,22 @@ def _summarize_specials(
 _OVERLOP_RATIO = 0.15
 
 
-def _seg_of_node(node: MDFileHead, spans: dict[int, tuple[int, int]]) -> Segment:
+def _seg_of_node(
+    node: MDFileHead, spans: dict[int, tuple[int, int]], file_path: str
+) -> Segment:
     """把一个节点**自己**的正文（不含子节点）包成 `Segment`。
 
     `special_content` 用**节点上原来那批对象**（第 4 步填的），不重新造 ——
     摘要在那些对象上，造新的就把它丢了。
+
+    `file_path` 写进**段**里而不是留在 chunk 上：跨文件合并后一个 chunk 的段
+    可能来自不同文件，来源只有跟着段走才不会串。
     """
     start, end = spans[id(node)]
     return Segment(
         pref=node.pref,
         text=node.content,
+        file_path=file_path,
         start_line=start,
         end_line=end,
         tokens=node.content_token,
@@ -404,11 +410,13 @@ def _seg_of_node(node: MDFileHead, spans: dict[int, tuple[int, int]]) -> Segment
     )
 
 
-def _subtree_segs(node: MDFileHead, spans: dict[int, tuple[int, int]]) -> list[Segment]:
+def _subtree_segs(
+    node: MDFileHead, spans: dict[int, tuple[int, int]], file_path: str
+) -> list[Segment]:
     """把整棵子树按阅读顺序（前序）展开成片段列表。`content` 为空的节点不产出片段。"""
-    segs = [_seg_of_node(node, spans)] if node.content else []
+    segs = [_seg_of_node(node, spans, file_path)] if node.content else []
     for child in node.child_head:
-        segs.extend(_subtree_segs(child, spans))
+        segs.extend(_subtree_segs(child, spans, file_path))
     return segs
 
 
@@ -432,11 +440,10 @@ class _CutHelper:
         self.segments.append(seg)
         self.tokens += seg.tokens
 
-    def to_draft(self, file_path: str) -> ChunkDraft:
-        """结算成 `ChunkDraft`。行区间和 `special_content` 由它自己从 segments 推。"""
+    def to_draft(self) -> ChunkDraft:
+        """结算成 `ChunkDraft`。`file_path` 和 `special_content` 由它自己从 segments 推。"""
         return ChunkDraft(
             segments=list(self.segments),
-            file_path=file_path,
             tokens=self.tokens,
         )
 
@@ -605,6 +612,7 @@ def _in_line_back(line: str, cut: int, overlop: int) -> int:
 def content_cut(
     cut_helper:_CutHelper,
     file_head:MDFileHead,
+    file_path:str,
     base_line:int,
     base_col:int,
     max_token:int,
@@ -628,6 +636,7 @@ def content_cut(
     Args:
         cut_helper: 累加器，上半段并进这里。
         file_head: 待切的节点。**原地改它的 `content`**，删掉已切走的上半段。
+        file_path: 来源文件路径，写进切出来的每个 `Segment`。
         base_line: `file_head.content` 首字符所在行在**清洗后全文**里的行号。
         base_col: 该行内的字符偏移 —— 上一刀切在行内时不为 0。
         max_token: 单段 token 上限（软约束）。
@@ -661,6 +670,7 @@ def content_cut(
             Segment(
                 pref=file_head.pref,
                 text=cut_text,
+                file_path=file_path,
                 start_line=base_line,
                 end_line=cut_end,
                 tokens=_count_token(cut_text),
@@ -711,30 +721,34 @@ def content_cut(
 def _join_chunks(chunks: list[ChunkDraft]) -> ChunkDraft:
     """把若干 chunk 按阅读顺序拼成一个。
 
-    `ChunkDraft.__post_init__` 会从拼好的 `segments` 重推行区间、`special_content`、
-    `content_hash` 和 `chunk_id`，所以这里只管拼段、累加 token。
+    `ChunkDraft.__post_init__` 会从拼好的 `segments` 推出 `file_path` 与
+    `special_content`，所以这里只管拼段、累加 token。`content_hash` 与 `chunk_id`
+    要到 `Chunk` 才生成 —— `ChunkDraft` 上没有这两个字段。
 
     Args:
-        chunks: 同源（同一 `file_path`）的 chunk，非空。
+        chunks: 待拼的 chunk，非空。**可以来自不同文件** —— 来源记在各段上，
+            拼完由 `ChunkDraft` 汇总成路径列表。
 
     Returns:
         拼成的单个 chunk。
     """
     return ChunkDraft(
         segments=[seg for chunk in chunks for seg in chunk.segments],
-        file_path=chunks[0].file_path,
         tokens=sum(chunk.tokens for chunk in chunks),
     )
 
 
-def _merge_small_chunks(
+def merge_small_chunks(
     chunks: list[ChunkDraft], min_token: int
 ) -> list[ChunkDraft]:
     """把 token 量小于 `min_token` 的 chunk 并进相邻的 chunk。
 
     短 chunk 在检索里会当「吸引子」：文本越短，向量越「通用」，跟什么查询都不算远。
-    实测一个 13 token 的块在多个不相关查询里排到第 1，把正确答案挤到第 2。
-    并进邻居之后它只作为上下文存在，不再单独参与召回。
+    实测（`explore/实际测试/e2e检索测试/干扰块实验.md`）：增量注入 52 个沾边小 chunk
+    （24 token）后，**单路向量检索的 MRR@10 从 0.804 掉到 0.372**、Hit@1 从 65.4%
+    掉到 15.4%；BM25 侧只掉 0.019，但这批短块被算进平均文档长度，使 fts5 的 avgdl
+    从 724.5 降到 609 —— 长文档受到的长度惩罚因此变重。
+    并进邻居之后短块只作为上下文存在，不再单独参与召回。
 
     归宿按优先级逐块扫一遍决定：
 
@@ -742,15 +756,19 @@ def _merge_small_chunks(
     2. **没有上一个就并进下一个** —— 文档开头就是短块时；下一个还没出现，先攒着
     3. **两边都没有就丢弃** —— 整篇只切出一个短块，没有可依附的邻居
 
-    合并**不重新判定**：只认 `cut` 产出的原始大小，拼出来的结果再小也不继续找下家。
-    只并相邻块，所以合并后的行区间仍然连续。
+    合并**不重新判定**：只认切分产出的原始大小，拼出来的结果再小也不继续找下家。
+    只并相邻块，所以合并后的段序仍然连续。
+
+    **跨文件合并也走这里。** `chunk_md_files` 逐文件切成之后把全部结果汇总过来，
+    于是「自身不足一个 chunk 的小文件」也能并进相邻文件的块，而不是被丢掉。
 
     Note:
         合并会让 chunk 超过 `max_token` —— 短块是塞进已经装好的邻居里的，不是重新装箱。
         这是刻意的取舍：短块单独成块对检索的伤害比这一点溢出大。
 
     Args:
-        chunks: `cut` 产出的 chunk 列表，按阅读顺序。
+        chunks: 切分产出的 chunk 列表，按阅读顺序。**可以来自不同文件** ——
+            来源记在各段上，合并后由 `ChunkDraft` 汇总成路径列表。
         min_token: 判定阈值，`tokens` 严格小于它的算短块。
 
     Returns:
@@ -786,7 +804,6 @@ def cut(
     max_token:int,
     file_path:str,
     overlop:int|None=None,
-    min_token:int|None=None,
 )->list[ChunkDraft]:
     """按标题把整棵树切成 chunk。
 
@@ -799,15 +816,18 @@ def cut(
     Args:
         root: `_build_file_tree` 产出的树（虚拟根），`special_content` 需已填好。
         max_token: 单个 chunk 的 token 上限（软约束，不可切的块会突破）。
-        file_path: 来源文件路径，原样写进每个 `ChunkDraft`。它直接参与 `chunk_id`，
-            所以传相对路径才能让 ID 跨机器可移植。
+        file_path: 写进每个 `Segment.file_path` 的路径串 —— 也就是最终进 `chunk_id`
+            的那个值（`chunk_id` 到 `Chunk` 才生成）。传相对路径才能让 ID 跨机器
+            可移植；跨文件合并之后，`ChunkDraft.file_path` 是它们的去重列表。
         overlop: 重叠区 token 数，透传给 `content_cut`。
-        min_token: 短块阈值（token）。小于它的 chunk 会被并进相邻 chunk，
-            `None`（默认）表示不做合并。取舍见 `_merge_small_chunks`。
 
     Returns:
-        按阅读顺序排列的 `ChunkDraft` 列表。整篇装得下时只返回一个；
-        给了 `min_token` 且整篇只切出一个短块时返回空列表。
+        按阅读顺序排列的 `ChunkDraft` 列表。整篇装得下时只返回一个。
+
+    Note:
+        **小 chunk 的合并不在这里做。** 要合并请把结果交给 `merge_small_chunks`
+        —— 切分与合并是两个正交的决策；而且**跨文件合并必须先拿到全部文件的结果**，
+        放在这里就永远只看得到单个文件。取舍见 `merge_small_chunks`。
     """
     spans = _locate_spans(root)
     chunk_list: list[ChunkDraft] = []
@@ -817,7 +837,7 @@ def cut(
         """把累加器里的段结算成一个 chunk，并清空。"""
         if not cut_helper.segments:
             return
-        chunk_list.append(cut_helper.to_draft(file_path))
+        chunk_list.append(cut_helper.to_draft())
         cut_helper.reset()
 
     def _cut(file_head:MDFileHead):
@@ -828,7 +848,7 @@ def cut(
         if 0 < file_head.total_tokens <= max_token:
             if cut_helper.segments and cut_helper.tokens + file_head.total_tokens > max_token:
                 flush()
-            for seg in _subtree_segs(file_head, spans):
+            for seg in _subtree_segs(file_head, spans, file_path):
                 cut_helper.add_seg(seg)
             return
 
@@ -838,7 +858,7 @@ def cut(
                 not cut_helper.segments
                 or cut_helper.tokens + file_head.content_token <= max_token
             ):
-                cut_helper.add_seg(_seg_of_node(file_head, spans))
+                cut_helper.add_seg(_seg_of_node(file_head, spans, file_path))
             else:
                 # 策略 3：正文自己就超限 -> 切开，循环到切完为止
                 flush()
@@ -846,7 +866,13 @@ def cut(
                 base_col = 0
                 while file_head.content:
                     base_line, base_col = content_cut(
-                        cut_helper, file_head, base_line, base_col, max_token, overlop
+                        cut_helper,
+                        file_head,
+                        file_path,
+                        base_line,
+                        base_col,
+                        max_token,
+                        overlop,
                     )
                     flush()
 
@@ -855,18 +881,16 @@ def cut(
 
     _cut(root)
     flush()
-    if min_token is None:
-        return chunk_list
-    return _merge_small_chunks(chunk_list, min_token)
+    return chunk_list
 
 
 def chunk_by_title(
     file_path:Path,
-    max_token,
-    start_line,
-    end_line=None,
+    max_token:int,
+    start_line:int,
+    end_line:int|None=None,
     summary_func:Callable[[str], str]|None = None,
-    min_token:int|None = None)->list[ChunkDraft]:
+    source_name:str|None = None)->list[ChunkDraft]:
     """按标题把一个 Markdown 文件切成 chunk 草稿。
 
     流程：读取文件 -> 按行切片 -> 清洗 -> 建标题树 -> 并发总结特殊块 -> 切分。
@@ -879,16 +903,18 @@ def chunk_by_title(
         summary_func: 总结函数，入参是代码块 / 表格的原文，返回摘要文本。
             **由调用方注入**，本模块不绑定任何模型服务。传 `None` 则整步跳过，
             各块的 `summary` 保持 `None`。单个块抛异常只记 warning，不影响其余块。
-        min_token: 短块阈值（token）。小于它的 chunk 会被并进相邻 chunk，
-            `None`（默认）表示不做合并。**阈值不设默认值** —— 短 chunk 在检索里
-            会当「吸引子」，合并与不合并、阈值取多少，都得按调用方自己的语料实测
-            才知道，所以这里只给开关、不给建议值。取舍见 `_merge_small_chunks`。
-
+        source_name: 写进 `Segment.file_path` 的值 —— 也就是进 `chunk_id` 的那个
+            路径。`None`（默认）表示用 `str(file_path)`。要「用绝对路径读文件、
+            但让 ID 记相对路径」时传它：跨机器可移植靠的是 **ID 里那个值**，
+            与拿什么路径去读无关。
     Returns:
-        按阅读顺序排列的 `ChunkDraft` 列表。给了 `min_token` 且整篇只切出一个
-        短块时返回空列表。
+        按阅读顺序排列的 `ChunkDraft` 列表。
 
     Note:
+        **本函数只负责切割，不做小 chunk 合并。** 要合并请把结果交给
+        `merge_small_chunks`，或者直接用 `chunk_md_files` 处理整个文件夹
+        （它在跨文件汇总之后合并）。
+
         第 4 步之后的行号是相对**清洗后**文本的；叠加这里的切片偏移后，它已经
         不等于原文件行号。要精确回溯原文需要额外维护映射 —— `_clean_file_content`
         会吃掉连续空行，所以映射不是简单加一个偏移量。
@@ -926,24 +952,67 @@ def chunk_by_title(
         _summarize_specials(_collect_specials(filetree), summary_func)
 
     # 5. 切分
-    return cut(filetree, max_token, str(file_path), min_token=min_token)
+    return cut(
+        filetree, max_token, source_name if source_name is not None else str(file_path)
+    )
 
 
-# def chunk_md_files(folder_path:Path,
-#     max_token,
-#     start_line,
-#     end_line=None,
-#     summary_func:Callable[[str], str]|None = None,
-#     min_token:int|None = None)->list[ChunkDraft]:
-#     """
-#     对一个文件夹内所有的md进行切分
-#     原则：不能出现过小的chunk，过小的chunk会影响排序
-#     定义
-#     特殊情况：
-#     1. 若当前只有一个
+def chunk_md_files(
+    folder_path: Path,
+    max_token: int,
+    min_token: int,
+    start_line: int = 0,
+    end_line: int | None = None,
+    summary_func: Callable[[str], str] | None = None,
+) -> list[ChunkDraft]:
+    """切分一个文件夹里的全部 Markdown，并在**跨文件合并**小 chunk 之后返回。
 
-    
-#     """
+    与「逐文件调 `chunk_by_title`」的区别只有一处，但很关键：**合并发生在汇总之后**。
+    于是「自身不足一个 chunk 的小文件」也能并进相邻文件的块，而不是被丢掉；
+    单个文件内部找不到邻居的短块，在这里有了跨文件的邻居。
+
+    流程：按路径排序遍历 `**/*.md` → 逐个 `chunk_by_title`（只切割）→ 汇总
+    → `merge_small_chunks` 跨文件合并。
+
+    Args:
+        folder_path: 文件夹根，**递归**取其中所有 `.md`。
+        max_token: 单个 chunk 的 token 上限（软约束），透传给 `chunk_by_title`。
+        min_token: 短块阈值（token），透传给 `merge_small_chunks`。**不给默认值** ——
+            阈值取多少要按调用方自己的语料实测，这里只给参数、不给建议值。
+        start_line: 每个文件的起始行（0-based，左闭）。
+        end_line: 每个文件的结束行（0-based，**右开**）；`None` 表示读到文件末尾。
+        summary_func: 总结函数，透传给 `chunk_by_title`；`None` 则整步跳过。
+
+    Returns:
+        按「文件路径 → 文件内阅读顺序」排列的 `ChunkDraft` 列表。合并只发生在
+        相邻块之间，所以整体顺序不变。**整批只有一个短块时返回空列表** ——
+        见 `merge_small_chunks` 的归宿规则。
+
+    Note:
+        文件按**路径字符串排序**后才逐个处理。顺序不是可有可无的细节：合并的归宿、
+        段的先后、`chunk_id` 都由它决定 —— 排序才能让同一批语料每次切出同样的结果。
+
+        路径按 `path.as_posix()` 写进段里（统一用 `/`），顺序也按它排 —— 这样
+        Windows 与 POSIX 会得到相同的块序与相同的 `chunk_id`。想要 ID 跨机器可移植，
+        `folder_path` 还得是**相对路径**（相对语料根）。
+    """
+    chunks: list[ChunkDraft] = []
+    # 按 **POSIX 形式的路径串**排序，不用 `Path` 默认比较：后者在 Windows 走
+    # `normcase`（忽略大小写）、在 POSIX 是大小写敏感，同一批语料在两个平台上
+    # 会排出不同的顺序 —— 进而切出不同的 chunk_id。
+    for path in sorted(folder_path.rglob("*.md"), key=lambda p: p.as_posix()):
+        chunks.extend(
+            chunk_by_title(
+                path,
+                max_token,
+                start_line,
+                end_line=end_line,
+                summary_func=summary_func,
+                # 段里也记 POSIX 形式，`\` 与 `/` 的差异不会渗进 chunk_id
+                source_name=path.as_posix(),
+            )
+        )
+    return merge_small_chunks(chunks, min_token)
 
 
 
