@@ -9,8 +9,10 @@
 2. 环境变量里的
 """
 
+from dataclasses import dataclass
 import os
 from pathlib import Path
+from typing import Literal
 
 from dotenv import load_dotenv
 
@@ -71,6 +73,3 @@ class AliyunRerankAPIConfig:
         self.api_key = api_key or os.environ.get("ALY_API_KEY")
         self.model = model or os.environ.get("ALY_RERANK_API_MODEL")
 
-
-class VecDBConfig:
-    vec_db_path: Path

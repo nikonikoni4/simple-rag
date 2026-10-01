@@ -9,6 +9,6 @@
 - `VecDBConfig` —— 向量库配置（占位）
 """
 
-from .config import AliyunRerankAPIConfig, DoubaoAPIConfig, VecDBConfig
+from .config import AliyunRerankAPIConfig, DoubaoAPIConfig
 
-__all__ = ["AliyunRerankAPIConfig", "DoubaoAPIConfig", "VecDBConfig"]
+__all__ = ["AliyunRerankAPIConfig", "DoubaoAPIConfig"]
