@@ -34,11 +34,17 @@ from simple_rag.chunking.structured_file.types import (
 from simple_rag.db import Database
 from simple_rag.embedding_api import TextPart
 from simple_rag.repository.bm25 import BM25Index, create_bm25
-from simple_rag.repository.chunk_store import ChunkStore, Schema as ChunkSchema
-from simple_rag.repository.chunk_store._schema import TABLE_NAME as DATA_TABLE
-from simple_rag.repository.vec import Schema as VecSchema, VecDB
-from simple_rag.repository.vec._codec import vector_to_sqlite_vector
-from simple_rag.repository.vec._schema import TABLE_NAME as VEC_TABLE
+from simple_rag.repository.chunk_store import (
+    TABLE_NAME as DATA_TABLE,
+    ChunkStore,
+    Schema as ChunkSchema,
+)
+from simple_rag.repository.vec import (
+    TABLE_NAME as VEC_TABLE,
+    Schema as VecSchema,
+    VecDB,
+    vector_to_sqlite_vector,
+)
 from simple_rag.tokenization import Tokenizer
 
 # 单次索引任务里同时在飞的 embedding 请求数。embed 是网络调用，一次把几百个
