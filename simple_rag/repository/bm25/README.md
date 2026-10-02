@@ -8,7 +8,7 @@ BM25 关键词检索。对外只有三样东西：**`BM25Index`（统一接口�
 
 - `fts5_bm25` —— SQLite FTS5 虚拟表，打分用内置 `bm25()`。可增量、持久化
   就在注入的 db 文件里；`k1` / `b` 被 FTS5 硬编码在 1.2 / 0.75 **不可调**
-  （[已知限制](../../../../docs/known-limitations/2026-09-29-fts5参数不可调.md)）。
+  （[已知限制](../../../docs/known-limitations/2026-09-29-fts5参数不可调.md)）。
 - `rank_bm25` —— rank_bm25 库的 `BM25Okapi`。`k1` / `b` **可调**（默认 1.5 / 0.75）；
   纯内存，无增量 —— `insert` / `delete` / `replace` 直接抛 `NotImplementedError`，
   改数据只能 `rebuild` 全量重建；可选 pickle 持久化（构造时给 `persist_path`）。
@@ -19,16 +19,16 @@ BM25 关键词检索。对外只有三样东西：**`BM25Index`（统一接口�
 
 **它不认识任何业务概念** —— 存什么文本、`chunk_id` 怎么生成，都是调用方的决定。
 
-- 选型依据与性能实测：[explore/bm25/FINDINGS.md](../../../../explore/bm25/FINDINGS.md)
-- FTS5 内部结构（表布局、`block` 格式、公式）：[explore/bm25/TECHNICAL.md](../../../../explore/bm25/TECHNICAL.md)
-- 统一接口的取舍记录：[docs/ADR/2026-09-29-BM25多实现统一接口.md](../../../../docs/ADR/2026-09-29-BM25多实现统一接口.md)
+- 选型依据与性能实测：[explore/bm25/FINDINGS.md](../../../explore/bm25/FINDINGS.md)
+- FTS5 内部结构（表布局、`block` 格式、公式）：[explore/bm25/TECHNICAL.md](../../../explore/bm25/TECHNICAL.md)
+- 统一接口的取舍记录：[docs/ADR/2026-09-29-BM25多实现统一接口.md](../../../docs/ADR/2026-09-29-BM25多实现统一接口.md)
 
 ## 存的是什么
 
 **不是原文，是分词后的 token。** FTS5 的内置 tokenizer 对中文无效 ——
 `unicode61` 会把整句当成**一个** token，查 `检索` 零命中；`trigram` 又要求
 查询串 ≥3 字符。所以中文必须自己切（**实测**
-[FINDINGS.md §4](../../../../explore/bm25/FINDINGS.md)）。rank_bm25 同理 ——
+[FINDINGS.md §4](../../../explore/bm25/FINDINGS.md)）。rank_bm25 同理 ——
 `BM25Okapi` 吃的是 token 列表。
 
 所有写入口收的 `text` 都是**原文**，分词在实现内做；调用方不用管。
@@ -90,7 +90,7 @@ hits = bm25.search("检索", k=10)      # 分数同样是「越小越相关」
 （fts5 钳 1e-6 / okapi 用 `ε×平均idf`）与默认参数。所以：查询词都满足
 `n < N/2`（正 idf）时两边分数逐位相同、排序一致；含 `n ≥ N/2` 的高频词时
 排序可能不同，且**精确并列时打破规则不同**。统一的是接口与分数方向，
-实测见 [explore/bm25/同参数一致性.md](../../../../explore/bm25/同参数一致性.md)。
+实测见 [explore/bm25/同参数一致性.md](../../../explore/bm25/同参数一致性.md)。
 
 ## 调用方要知道的约束
 
@@ -162,9 +162,23 @@ FTS5 是 `match ? order by bm25() limit ?`；参数与返回结构也不一样�
 硬抽一层只会得到到处 `if` 的壳，而每个分支还要单独测。
 **只有两种查询、形状差异大，分别实现的可测性收益更大。**
 
+## 待实现：走数据库的第三类实现
+
+已决定新增**第三类实现**（见 [ADR 2026-10-02](../../../docs/ADR/2026-10-02-新增第三类BM25实现.md)）：
+同样走数据库，数据表由本项目自己设计。原因是现有两类各有一处不满足需求：
+
+1. **fts5 不能修改参数** —— `k1` / `b` 被 FTS5 硬编码在 1.2 / 0.75（传参直接报错）。
+2. **rank_bm25 每次需要把全部内容读进内存** —— `BM25Okapi` 把全库构造成常驻结构，
+   50,000 篇实测 **1,927 MB**（≈38 KB/篇，随 N 严格线性）；同样数据放 SQLite 只有
+   **~2 MB** 页缓存。实测见 [explore/bm25/README.md](../../../explore/bm25/README.md)。
+
+本类**尚未实现**，工厂里也没有它 —— 这里只记录决策，不落代码。
+
 ## 未验证
 
 - 分词质量、与向量检索的**融合策略**（本模块只负责存与查）
 - jieba 的未登录词、自定义词典
 - 停用词表能否降低查询延迟（命中集变小 → `order by bm25()` 更快）
-- rank_bm25 实现在大语料下的内存占用与查询延迟（`get_scores` 是全量打分）
+
+（原文里「rank_bm25 在大语料下的内存占用与查询延迟」一条已于 2026-10-02 实测闭合，
+见上节与 [explore/bm25/README.md](../../../explore/bm25/README.md)。）
