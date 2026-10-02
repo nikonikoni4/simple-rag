@@ -11,7 +11,7 @@
 - `TABLE_NAME` —— 表名
 - `vector_to_sqlite_vector` —— 向量编码（归一化 + dtype + NaN 检查）
 
-后两个是给**跨表写 SQL 的编排层**用的（`simple_rag.embedding` 要拼
+后两个是给**跨表写 SQL 的编排层**用的（`simple_rag.indexing` 要拼
 `chunk_id in (select chunk_id from 数据表 where path = ?)`）。单独用本包不需要它们。
 
 **连接由调用方注入**（`simple_rag.db.Database`）—— 本包不创建、也不关闭它。

@@ -17,7 +17,7 @@
 - `ChunkStore` —— 建表、增删改查
 - `Schema` —— 调用方要加的扩展列
 - `ChunkRow` —— `get` 的返回
-- `TABLE_NAME` —— 表名。给**跨表写 SQL 的编排层**用（`simple_rag.embedding`
+- `TABLE_NAME` —— 表名。给**跨表写 SQL 的编排层**用（`simple_rag.indexing`
   要拼 `chunk_id in (select chunk_id from 本表 where path = ?)`）
 
 **连接由调用方注入**（`simple_rag.db.Database`）—— 本包不创建、也不关闭它。

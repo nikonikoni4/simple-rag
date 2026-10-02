@@ -12,7 +12,7 @@ import pytest
 
 from simple_rag.chunking.structured_file.types import Chunk, ChunkDraft, Segment
 from simple_rag.db import Database
-from simple_rag.embedding.embedding import RagIndexingPipeline, RagIndexStrategy
+from simple_rag.indexing import RagIndexingPipeline, RagIndexStrategy
 from simple_rag.repository.bm25 import create_bm25
 from simple_rag.repository.chunk_store import ChunkStore
 from simple_rag.repository.chunk_store import Schema as ChunkSchema

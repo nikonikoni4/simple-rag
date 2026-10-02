@@ -1,4 +1,4 @@
-"""`simple_rag.embedding` —— 索引构建的编排层。
+"""`simple_rag.indexing` —— 索引构建的编排层。
 
 对外两个名字：`RagIndexStrategy`（配置）与 `RagIndexingPipeline`（执行）。
 
@@ -6,6 +6,6 @@
 `RagIndexingPipeline.store()`，一次入库圈在一个事务里。
 """
 
-from .embedding import RagIndexingPipeline, RagIndexStrategy
+from .indexing import RagIndexingPipeline, RagIndexStrategy
 
 __all__ = ["RagIndexingPipeline", "RagIndexStrategy"]
