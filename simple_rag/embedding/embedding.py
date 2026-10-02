@@ -47,9 +47,13 @@ from simple_rag.repository.vec import (
 )
 from simple_rag.tokenization import Tokenizer
 
-# 单次索引任务里同时在飞的 embedding 请求数。embed 是网络调用，一次把几百个
-# chunk 全抛出去会被限流
-_EMBED_CONCURRENCY = 8
+# 单次索引任务里同时在飞的 embedding 请求数。
+#
+# 实测（2026-10-02）：豆包按账户限流（429 `AccountRateLimitExceeded`），阈值在
+# 大请求 170 条上下，**且不返回 `retry-after`**。并发 4 的多次探测没触发过，
+# 8 一撞就整批失败 —— 所以压到 4。真撞上了由客户端的退避重试兜着
+# （`DoubaoEmbeddingVision` 的 `max_retries`）。
+_EMBED_CONCURRENCY = 4
 
 # 扩展列的取值回调：一个 chunk 进，一份 `{列名: 值}` 出。
 # 两张表各按自己的 Schema 去里面取自己声明过的列。

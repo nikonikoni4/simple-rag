@@ -11,6 +11,7 @@ embed 在检索链路上是逐查询调用，挂起等响应而不占线程。
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -18,6 +19,9 @@ from typing import Any
 import httpx
 
 from simple_rag.config import DoubaoAPIConfig
+
+# 限流退避：只重试 429，等待时长按 2 的幂增长（起始值可配）。
+_RETRY_STATUS = 429
 
 
 @dataclass(frozen=True)
@@ -94,10 +98,14 @@ def _extract_result(payload: dict[str, Any]) -> DoubaoEmbeddingResult:
 
 
 class DoubaoEmbeddingVision:
-    """豆包多模态向量化客户端。一个实例可复用，不做重试。
+    """豆包多模态向量化客户端。一个实例可复用。
 
     异步生命周期：`httpx.AsyncClient` 懒创建（第一次调用时才建，此时必然已在
     event loop 里），用完 `aclose()`，或直接 `async with` 管理。
+
+    **限流自动退避**：撞上 429（`AccountRateLimitExceeded`）时按 2 的幂等待后重试，
+    最多 `max_retries` 次。服务端**不返回 `retry-after`**（实测 2026-10-02），
+    节奏只能客户端自己定 —— 所以等待时长由 `retry_base_wait` 起算、逐次翻倍。
     """
 
     def __init__(
@@ -105,6 +113,8 @@ class DoubaoEmbeddingVision:
         config: DoubaoAPIConfig,
         *,
         timeout: float = 60.0,
+        max_retries: int = 3,
+        retry_base_wait: float = 8.0,
     ) -> None:
         if not config.api_base:
             raise ValueError("缺少 api_base：构造 DoubaoAPIConfig 时传入，或设置环境变量 DOUBAO_API_BASE")
@@ -112,8 +122,12 @@ class DoubaoEmbeddingVision:
             raise ValueError("缺少 api_key：构造 DoubaoAPIConfig 时传入，或设置环境变量 DOUBAO_API_KEY")
         if not config.model:
             raise ValueError("缺少 model：构造 DoubaoAPIConfig 时传入，或设置环境变量 DOUBAO_EMBEDDING_MODEL_ID")
+        if max_retries < 0:
+            raise ValueError(f"max_retries 不能是负数，收到 {max_retries}")
         self._config = config
         self._timeout = timeout
+        self._max_retries = max_retries
+        self._retry_base_wait = retry_base_wait
         self._client: httpx.AsyncClient | None = None
 
     async def embed(
@@ -131,6 +145,10 @@ class DoubaoEmbeddingVision:
         - `dimensions` —— 稠密向量维度，可选 `1024` / `2048`；不传用服务端默认（2048）
         - `sparse` —— 是否同时要稀疏向量。**只支持纯文本输入**（服务端硬限制，
           带图片 / 视频会 400，这里提前拦下）
+
+        Raises:
+            httpx.HTTPStatusError: 非 2xx。429 会先退避重试（见类 docstring），
+                重试次数用尽后仍然抛 —— **不静默返回空向量**。
         """
         if sparse and any(not isinstance(part, TextPart) for part in parts):
             raise ValueError("稀疏向量只支持纯文本输入，parts 里不能有图片 / 视频")
@@ -147,13 +165,20 @@ class DoubaoEmbeddingVision:
         if sparse:
             body["sparse_embedding"] = {"type": "enabled"}
 
-        response = await self._get_client().post(
-            f"{self._config.api_base.rstrip('/')}/embeddings/multimodal",
-            headers={"Authorization": f"Bearer {self._config.api_key}"},
-            json=body,
-        )
-        response.raise_for_status()
-        return _extract_result(response.json())
+        url = f"{self._config.api_base.rstrip('/')}/embeddings/multimodal"
+        headers = {"Authorization": f"Bearer {self._config.api_key}"}
+
+        # 只对 429 退避重试：4xx 里其余的是请求本身的问题，重试多少次都一样
+        for attempt in range(self._max_retries + 1):
+            response = await self._get_client().post(url, headers=headers, json=body)
+            if response.status_code != _RETRY_STATUS:
+                response.raise_for_status()
+                return _extract_result(response.json())
+            if attempt < self._max_retries:
+                await asyncio.sleep(self._retry_base_wait * 2**attempt)
+
+        response.raise_for_status()  # 重试用尽：抛最后一次的 429
+        raise AssertionError("unreachable")  # raise_for_status 必然抛
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:

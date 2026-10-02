@@ -20,12 +20,23 @@ from simple_rag.embedding_api import DoubaoEmbeddingVision, ImagePart, TextPart
 
 
 class FakeAPI:
-    """假豆包端点：记录收到的请求，按脚本返回响应。"""
+    """假豆包端点：记录收到的请求，按脚本返回响应。
 
-    def __init__(self, payload: dict, *, status: int = 200) -> None:
+    `statuses` 给了就按序返回（用完停在最后一个），没给就一律返回 `status`。
+    """
+
+    def __init__(
+        self, payload: dict, *, status: int = 200, statuses: list[int] | None = None
+    ) -> None:
         self.requests: list[dict] = []  # 每次请求的 {url, authorization, body}
         self.payload = payload
         self.status = status
+        self.statuses = statuses
+
+    def _status_for(self, index: int) -> int:
+        if self.statuses is None:
+            return self.status
+        return self.statuses[min(index, len(self.statuses) - 1)]
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(
@@ -35,8 +46,9 @@ class FakeAPI:
                 "body": json.loads(request.content),
             }
         )
-        if self.status != 200:
-            return httpx.Response(self.status, json={"error": {"message": "bad"}})
+        status = self._status_for(len(self.requests) - 1)
+        if status != 200:
+            return httpx.Response(status, json={"error": {"message": "bad"}})
         return httpx.Response(200, json=self.payload)
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -55,9 +67,12 @@ class FakeAPI:
         monkeypatch.setattr(httpx, "AsyncClient", factory)
 
 
-def make_client(*, api_base: str = "https://fake.test") -> DoubaoEmbeddingVision:
+def make_client(
+    *, api_base: str = "https://fake.test", **kwargs: object
+) -> DoubaoEmbeddingVision:
     return DoubaoEmbeddingVision(
-        DoubaoAPIConfig(api_base=api_base, api_key="k-test", model="m-test")
+        DoubaoAPIConfig(api_base=api_base, api_key="k-test", model="m-test"),
+        **kwargs,  # type: ignore[arg-type]
     )
 
 
@@ -233,6 +248,100 @@ def test_非2xx抛HTTPStatusError(monkeypatch: pytest.MonkeyPatch) -> None:
         asyncio.run(make_client().embed([TextPart("x")]))
 
     assert exc_info.value.response.status_code == 401
+
+
+# ---------------------------------------------------------------- 429 退避重试
+
+
+class _Slept(list):
+    """记录每次退避实际等了多久。"""
+
+
+@pytest.fixture
+def slept(monkeypatch: pytest.MonkeyPatch) -> _Slept:
+    """把 `asyncio.sleep` 换掉 —— 真等 8 秒的测试没人跑。
+
+    换的是模块属性，`doubao` 里写 `asyncio.sleep(...)` 所以会走到这里。
+    """
+    recorded = _Slept()
+
+    async def fake_sleep(seconds: float) -> None:
+        recorded.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    return recorded
+
+
+def test_429重试后成功(monkeypatch: pytest.MonkeyPatch, slept: _Slept) -> None:
+    """限流是暂时的：退避之后重试，最终拿到正常结果。
+
+    实测（2026-10-02）：豆包把限流报成 429 `AccountRateLimitExceeded`，
+    **不返回 `retry-after`** —— 节奏只能客户端自己定，所以必须自己退避。
+    """
+    api = FakeAPI(ok_payload([0.1]), statuses=[429, 429, 200])
+    api.install(monkeypatch)
+
+    result = asyncio.run(make_client().embed([TextPart("x")]))
+
+    assert result.dense == [0.1]
+    assert len(api.requests) == 3
+
+
+def test_退避是翻倍的(monkeypatch: pytest.MonkeyPatch, slept: _Slept) -> None:
+    """等的时间按 2 的幂增长，不是固定间隔。"""
+    api = FakeAPI(ok_payload([0.1]), statuses=[429, 429, 200])
+    api.install(monkeypatch)
+
+    asyncio.run(make_client(retry_base_wait=1.0).embed([TextPart("x")]))
+
+    assert slept == [1.0, 2.0]
+
+
+def test_重试次数用尽后抛出(monkeypatch: pytest.MonkeyPatch, slept: _Slept) -> None:
+    """一直 429 就抛 —— 不许无限重试，也不许静默返回空向量。"""
+    api = FakeAPI(ok_payload([0.1]), statuses=[429])
+    api.install(monkeypatch)
+
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        asyncio.run(make_client().embed([TextPart("x")]))
+
+    assert exc_info.value.response.status_code == 429
+    assert len(api.requests) == 4  # 首发 1 次 + 默认重试 3 次
+
+
+def test_重试次数可配置(monkeypatch: pytest.MonkeyPatch, slept: _Slept) -> None:
+    api = FakeAPI(ok_payload([0.1]), statuses=[429])
+    api.install(monkeypatch)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(make_client(max_retries=1).embed([TextPart("x")]))
+
+    assert len(api.requests) == 2
+
+
+def test_重试次数为0时一次都不重试(
+    monkeypatch: pytest.MonkeyPatch, slept: _Slept
+) -> None:
+    api = FakeAPI(ok_payload([0.1]), statuses=[429])
+    api.install(monkeypatch)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(make_client(max_retries=0).embed([TextPart("x")]))
+
+    assert len(api.requests) == 1
+    assert slept == []
+
+
+def test_非429不重试(monkeypatch: pytest.MonkeyPatch, slept: _Slept) -> None:
+    """400 是请求本身的问题，重试多少次都一样 —— 立刻抛。"""
+    api = FakeAPI({}, status=400)
+    api.install(monkeypatch)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(make_client().embed([TextPart("x")]))
+
+    assert len(api.requests) == 1
+    assert slept == []
 
 
 def test_aclose幂等(monkeypatch: pytest.MonkeyPatch) -> None:
