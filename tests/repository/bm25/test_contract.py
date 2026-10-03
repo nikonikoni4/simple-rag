@@ -1,8 +1,8 @@
-"""两个实现的统一契约 —— 参数化跑同一套断言。
+"""三个实现的统一契约 —— 参数化跑同一套断言。
 
 只断言**接口语义必须一致**的部分（能查回、负分、升序、空查询空结果、
-空批清空、不支持的操作抛错）。不断言两边分数或排序逐位相同 —— 两实现的
-idf 公式与默认 k1/b 本来就不同，那不是契约的一部分。
+空批清空、不支持的操作抛错）。不断言各实现分数或排序逐位相同 —— 三者的
+idf 处理与默认 k1/b 本来就不同，那不是契约的一部分。
 """
 
 from __future__ import annotations
@@ -18,12 +18,12 @@ from simple_rag.tokenization import TokenizerFactory
 DOC = "向量检索是基于语义的检索方法"
 OTHER = "BM25 是基于词频的检索方法"
 
-IMPLS = ["fts5", "rank_bm25"]
+IMPLS = ["fts5", "rank_bm25", "own_bm25"]
 
 
 def cid(n: int) -> str:
-    """32 位 hex（blake2b）—— 满足两边的要求（fts5 要 >=15 位 hex，
-    rank_bm25 任意 str 都行）。
+    """32 位 hex（blake2b）—— 满足三边的要求（fts5 要 >=15 位 hex，
+    rank_bm25 / own_bm25 任意非空 str 都行）。
 
     ⚠️ 不能用 `f"{n:032x}"`：前 15 位全 0，fts5 的 rowid 会撞成同一个。
     """
@@ -37,10 +37,10 @@ def tok():
 
 @pytest.fixture(params=IMPLS)
 def index(request, tok, tmp_path):
-    """参数化的 `BM25Index`。fts5 挂真临时库；rank_bm25 纯内存。"""
-    if request.param == "fts5":
+    """参数化的 `BM25Index`。fts5 / own_bm25 挂真临时库；rank_bm25 纯内存。"""
+    if request.param in ("fts5", "own_bm25"):
         db = Database(tmp_path / "bm25.db")
-        instance = create_bm25("fts5", tokenizer=tok, conn=db.connection)
+        instance = create_bm25(request.param, tokenizer=tok, conn=db.connection)
     else:
         db = None
         instance = create_bm25("rank_bm25", tokenizer=tok)

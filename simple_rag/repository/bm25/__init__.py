@@ -1,7 +1,7 @@
 """`simple_rag.repository.bm25` —— BM25 关键词检索（多实现，统一接口）。
 
 **与 `vec` 互不依赖。** 两边只共用调用方注入的连接（`simple_rag.db.Database`，
-仅 fts5 实现用）与分词器（`simple_rag.tokenization`）。
+fts5 与 own_bm25 用）与分词器（`simple_rag.tokenization`）。
 
 对外只有三样东西：`BM25Index`（统一接口）、`BM25SearchResult`（输出形状）、
 `create_bm25`（工厂）。**具体实现类不出口** —— 换实现是 `create_bm25` 的
@@ -10,14 +10,15 @@
 分词器**不落盘** —— 换分词器要全库重建是调用方的运维动作。两侧不一致时同一个词
 不是同一个 token，**结果是静默零召回、不报错**。
 
-两个实现的能力差异（详见包 README）：
+三个实现的能力差异（详见包 README）：
 
-| | fts5 | rank_bm25 |
-|---|---|---|
-| 持久化 | SQLite（注入的连接） | pickle 文件（构造时给 `persist_path`）或纯内存 |
-| 增量 insert / delete / replace | 支持 | **抛 `NotImplementedError`**，只能 `rebuild` |
-| `k1` / `b` | 不可调（FTS5 硬编码 1.2 / 0.75） | 可调（默认 1.5 / 0.75） |
-| chunk_id 形状 | >= 15 位 hex（rowid 派生） | 任意非空 str |
+| | fts5 | rank_bm25 | own_bm25 |
+|---|---|---|---|
+| 持久化 | SQLite（注入的连接） | pickle 文件（构造时给 `persist_path`）或纯内存 | SQLite（注入的连接，自设计表） |
+| 增量 insert / delete / replace | 支持 | **抛 `NotImplementedError`**，只能 `rebuild` | 支持 |
+| `k1` / `b` | 不可调（FTS5 硬编码 1.2 / 0.75） | 可调（默认 1.5 / 0.75） | 可调，**且换参数不用重建** |
+| 语料常驻内存 | 否 | **是**（随 N 线性） | 否 |
+| chunk_id 形状 | >= 15 位 hex（rowid 派生） | 任意 str（空串放行，只是永不命中） | 任意 str（空串放行，只是永不命中） |
 """
 
 from __future__ import annotations
@@ -32,12 +33,13 @@ from simple_rag.tokenization import Tokenizer
 from .base import BM25Index, BM25SearchResult
 from .fts5_bm25 import FTS5BM25Index
 from .okapi_bm25 import RankBM25Index
+from .own_bm25 import OwnBM25Index
 
 __all__ = ["BM25Index", "BM25SearchResult", "create_bm25"]
 
 
 def create_bm25(
-    impl: Literal["fts5", "rank_bm25"],
+    impl: Literal["fts5", "rank_bm25", "own_bm25"],
     *,
     tokenizer: Tokenizer,
     conn: sqlite3.Connection | None = None,
@@ -48,17 +50,24 @@ def create_bm25(
     """按实现名造一个 `BM25Index`。
 
     Args:
-        impl: `"fts5"`（SQLite FTS5，可增量、持久化在 db 文件里）或
-            `"rank_bm25"`（BM25Okapi，k1/b 可调、无增量）。
-        tokenizer: 分词器，写入与查询共用，两实现都要。
-        conn: 仅 fts5 需要 —— 调用方注入的 SQLite 连接，实现不持有其生命周期。
-        k1: 仅 rank_bm25 —— 词频饱和参数，缺省取库默认 1.5。**None 是哨兵**：
-            fts5 只要显式传了（哪怕传 1.5）就报错 —— 它硬编码在 1.2，
-            显式传默认值与「没传」不可区分时，静默放行就是让调用方以为
-            参数生效了。
-        b: 仅 rank_bm25 —— 文档长度归一化强度，缺省取库默认 0.75；同 k1。
-        persist_path: 仅 rank_bm25 —— pickle 持久化路径；fts5 传了报错
-            （它的持久化就是注入的那个 db 文件）。
+        impl: `"fts5"`（SQLite FTS5，可增量、持久化在 db 文件里）、
+            `"rank_bm25"`（BM25Okapi，k1/b 可调、无增量）或
+            `"own_bm25"`（自设计 SQLite 表，可增量、k1/b 可调且换参数不用重建）。
+        tokenizer: 分词器，写入与查询共用，三个实现都要。
+        conn: fts5 与 own_bm25 需要 —— 调用方注入的 SQLite 连接，
+            实现不持有其生命周期。
+        k1: `rank_bm25` / `own_bm25` 的词频饱和参数，缺省取默认 1.5。
+            合法域是「有限数值且 `>= 0`」，但**两个实现拦得不一样**：
+            `own_bm25` 构造时显式拒绝 `nan` / `inf` / `bool` / 非数值；
+            `rank_bm25` 沿用它自己那套（`nan < 0` 是 False，**放行 `nan` / `inf`**）——
+            那是既有行为，本次未改，写在这里免得调用方以为两边一样。
+            **None 是哨兵**：fts5 只要显式传了（哪怕传 1.5）就报错 ——
+            它硬编码在 1.2，显式传默认值与「没传」不可区分时，
+            静默放行就是让调用方以为参数生效了。
+        b: `rank_bm25` / `own_bm25` 的文档长度归一化强度，缺省取默认 0.75。
+            合法域是 `0 <= b <= 1`，同样只有 `own_bm25` 拦 `nan` / `inf`。
+        persist_path: 仅 rank_bm25 —— pickle 持久化路径；fts5 与 own_bm25
+            传了报错（它们的持久化就是注入的那个 db 文件）。
 
     Returns:
         统一接口 `BM25Index` 的实例。用前先 `open()`。
@@ -70,6 +79,7 @@ def create_bm25(
     builders: dict[str, Callable[[], BM25Index]] = {
         "fts5": lambda: _build_fts5(tokenizer, conn, k1, b, persist_path),
         "rank_bm25": lambda: _build_rank_bm25(tokenizer, conn, k1, b, persist_path),
+        "own_bm25": lambda: _build_own_bm25(tokenizer, conn, k1, b, persist_path),
     }
     builder = builders.get(impl)
     if builder is None:
@@ -116,4 +126,26 @@ def _build_rank_bm25(
         k1=1.5 if k1 is None else k1,
         b=0.75 if b is None else b,
         persist_path=persist_path,
+    )
+
+
+def _build_own_bm25(
+    tokenizer: Tokenizer,
+    conn: sqlite3.Connection | None,
+    k1: float | None,
+    b: float | None,
+    persist_path: str | Path | None,
+) -> BM25Index:
+    if conn is None:
+        raise ValueError("own_bm25 实现需要 conn（调用方注入的 SQLite 连接）")
+    if persist_path is not None:
+        raise ValueError(
+            f"own_bm25 实现不支持 persist_path={persist_path!r}"
+            f"（它的持久化就是注入的那个 db 文件）"
+        )
+    return OwnBM25Index(
+        conn,
+        tokenizer,
+        k1=1.5 if k1 is None else k1,
+        b=0.75 if b is None else b,
     )
