@@ -22,6 +22,10 @@ from simple_rag.tokenization import Tokenizer, TokenizerFactory
 
 DIM = 4
 
+# BM25 通道的对外可选实现。`rank_bm25` 不在其中 —— `indexing.py` 的
+# `bm25_policy` 只收 `"fts5"` / `"own_bm25"`（它无增量、也不落注入的连接）。
+POLICIES = ["fts5", "own_bm25"]
+
 
 # ------------------------------------------------------------------ 假件
 
@@ -53,6 +57,7 @@ class _Setup:
     chunk_schema: ChunkSchema
     embedder: _FakeEmbedder
     tokenizer: Tokenizer
+    bm25_policy: str
 
     def vec(self) -> VecDB:
         store = VecDB(self.db.connection)
@@ -73,6 +78,7 @@ def _make(
     chunk_fields: tuple[str, ...] = (),
     min_tokens: int = 10,
     max_token: int = 512,
+    bm25_policy: str = "fts5",
 ) -> _Setup:
     vec_schema = VecSchema(dim=DIM, metric="cosine", fields=vec_fields)
     chunk_schema = ChunkSchema(fields=chunk_fields)
@@ -83,13 +89,15 @@ def _make(
         min_tokens=min_tokens,
         max_token=max_token,
         vec_schema=vec_schema if use_vec else None,
-        bm25_policy="fts5" if use_bm25 else "",
+        bm25_policy=bm25_policy if use_bm25 else "",
     )
     db = Database(":memory:")
     embedder = _FakeEmbedder()
     tokenizer = TokenizerFactory.create("jieba")
     pipeline = RagIndexingPipeline(strategy, db, embedder, tokenizer)
-    return _Setup(pipeline, db, vec_schema, chunk_schema, embedder, tokenizer)
+    return _Setup(
+        pipeline, db, vec_schema, chunk_schema, embedder, tokenizer, bm25_policy
+    )
 
 
 def _seg(text: str, path: str = "a.md", start: int = 1, end: int = 2) -> Segment:
@@ -105,8 +113,9 @@ def _chunk(text: str, path: str = "a.md", vec=None) -> Chunk:
 # ------------------------------------------------------------------ store
 
 
-def test_store把一批chunk写进三张表():
-    setup = _make()
+@pytest.mark.parametrize("policy", POLICIES)
+def test_store把一批chunk写进三张表(policy):
+    setup = _make(bm25_policy=policy)
     chunk = _chunk("苹果手机很好")
 
     setup.index.store([chunk])
@@ -183,8 +192,9 @@ def test_同一批里重复的chunk_id只写一条():
     assert len(setup.data().get(a.chunk_id)) == 1
 
 
-def test_一批里有一条非法就整批不落库():
-    setup = _make(vec_fields=("tag",))
+@pytest.mark.parametrize("policy", POLICIES)
+def test_一批里有一条非法就整批不落库(policy):
+    setup = _make(vec_fields=("tag",), bm25_policy=policy)
     good = _chunk("好。")
     bad = _chunk("坏。")
 
@@ -193,14 +203,16 @@ def test_一批里有一条非法就整批不落库():
 
     assert setup.vec().get(good.chunk_id) is None
     assert setup.data().get(good.chunk_id) == []
+    assert _bm25(setup).search("好", 5) == []  # 回滚要连 BM25 一起撤回
 
 
 # ------------------------------------------------------------------ delete_by_path
 
 
-def test_delete_by_path把沾到的chunk整个作废():
+@pytest.mark.parametrize("policy", POLICIES)
+def test_delete_by_path把沾到的chunk整个作废(policy):
     """跨文件合并的块沾了被改的文件时，它的全部行一起消失 —— 不留半行。"""
-    setup = _make()
+    setup = _make(bm25_policy=policy)
     merged = Chunk([_seg("甲。", "a.md", 1, 3), _seg("乙。", "b.md", 5, 6)], 4, np.ones(DIM))
     other = _chunk("丙。", "c.md")
     setup.index.store([merged, other])
@@ -242,8 +254,9 @@ def test_只开vec通道时不写bm25():
     assert setup.data().get(chunk.chunk_id) != []
 
 
-def test_只开bm25通道时不写vec():
-    setup = _make(use_vec=False, use_bm25=True)
+@pytest.mark.parametrize("policy", POLICIES)
+def test_只开bm25通道时不写vec(policy):
+    setup = _make(use_vec=False, use_bm25=True, bm25_policy=policy)
     chunk = _chunk("正文。")
 
     setup.index.store([chunk])
@@ -351,13 +364,14 @@ def test_embedding给模型的文本带面包屑():
     assert setup.embedder.texts == ["标题\n正文。"]
 
 
-def test_pipeline串起四步(tmp_path, monkeypatch):
+@pytest.mark.parametrize("policy", POLICIES)
+def test_pipeline串起四步(tmp_path, monkeypatch, policy):
     monkeypatch.chdir(tmp_path)
     # 内容要够长：太短又没邻居的块会被 merge 整个丢掉
     (tmp_path / "a.md").write_text(
         "# 甲\n\n" + "苹果手机很好。" * 50, encoding="utf-8"
     )
-    setup = _make()
+    setup = _make(bm25_policy=policy)
 
     asyncio.run(setup.index.pipeline([Path(".")]))
 
@@ -365,13 +379,16 @@ def test_pipeline串起四步(tmp_path, monkeypatch):
         "select count(*) from chunk_data"
     ).fetchone()[0]
     assert count == 1
+    assert len(_bm25(setup).search("苹果", 5)) == 1
 
 
 # ------------------------------------------------------------------ 辅助
 
 
 def _bm25(setup: _Setup):
-    """自己建一个 fts5 实例查同一个表 —— 不碰 pipeline 的私有属性。"""
-    index = create_bm25("fts5", tokenizer=setup.tokenizer, conn=setup.db.connection)
+    """按当前通道另建一个实例查同一个表 —— 不碰 pipeline 的私有属性。"""
+    index = create_bm25(
+        setup.bm25_policy, tokenizer=setup.tokenizer, conn=setup.db.connection
+    )
     index.open()
     return index

@@ -75,9 +75,8 @@ class RagIndexStrategy:
         max_token: 单个 chunk 的 token 上限（软约束），`chunking()` 用。
         vec_schema: 向量表的形状（`dim` / `metric` / `fields` / `filterable`）。
             不启用向量通道时给 `None`。
-        bm25_policy: BM25 用哪个实现，`"fts5"` 或 `"rank_bm25"`；空串表示不选实现。
-        rank_bm25_store_path: `rank_bm25` 的持久化文件路径。这个实现没有别的
-            落地方式，选它就必须给。
+        bm25_policy: BM25 用哪个实现，`"fts5"` 或 `"own_bm25"`；空串表示不选实现。
+            两者都用注入的连接落盘，没有需要调用方另外给的持久化参数。
     """
 
     use_vec: bool
@@ -86,15 +85,14 @@ class RagIndexStrategy:
     min_tokens: int
     max_token: int
     vec_schema: VecSchema | None = None
-    bm25_policy: Literal["fts5", "rank_bm25", ""] = ""
-    rank_bm25_store_path: Path | None = None
+    bm25_policy: Literal["fts5", "own_bm25", ""] = ""
 
     def __post_init__(self) -> None:
         """校验各字段的组合是否自洽，非法组合根本构造不出来。
 
         Raises:
             ValueError: 两个通道都关闭；开启向量通道但没给 `vec_schema`；
-                开启 BM25 但没选策略；选了 `rank_bm25` 但没给持久化路径。
+                开启 BM25 但没选策略。
         """
         if self.use_bm25 is False and self.use_vec is False:
             raise ValueError("不能设置全部索引通道都为False")
@@ -102,12 +100,6 @@ class RagIndexStrategy:
             raise ValueError("use_vec is True 但是没有设置 vec_schema")
         if self.use_bm25 is True and self.bm25_policy == "":
             raise ValueError("use_bm25 is True 但是没有选择策略")
-        if (
-            self.use_bm25 is True
-            and self.bm25_policy == "rank_bm25"
-            and self.rank_bm25_store_path is None
-        ):
-            raise ValueError("已选择bm25索引方式为rank_bm25,但是没有设置数据存储地址")
 
 
 def merge_chunks(min_tokens: int) -> Callable:
@@ -165,14 +157,11 @@ class RagIndexingPipeline:
 
         self._bm25: BM25Index | None = None
         if index_strategy.use_bm25:
-            fts5 = index_strategy.bm25_policy == "fts5"
+            # 两个实现都把语料落在注入的连接里，不需要别的持久化参数
             self._bm25 = create_bm25(
                 index_strategy.bm25_policy,
                 tokenizer=tokenizer,
-                conn=self._conn if fts5 else None,
-                persist_path=(
-                    None if fts5 else index_strategy.rank_bm25_store_path
-                ),
+                conn=self._conn,
             )
             self._bm25.open()
 
