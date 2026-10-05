@@ -4,5 +4,8 @@ explore
 .env
 __pycache__/
 *.py[cod]
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
 simple_rag.egg-info
 .claude
